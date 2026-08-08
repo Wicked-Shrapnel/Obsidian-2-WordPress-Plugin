@@ -2,12 +2,7 @@
 category:
 excerpt:
 status: draft
+comments: off
 wp-id:
+wp-sync:
 ---
-%% [[Writing Reference]] | Categories: Blog · News · Projects · To Do List · Uncategorized · Write Ups %%
-
-%%
-Ctrl + Alt + D = Draft
-Ctrl + Shift + P = Publish
-%%
-

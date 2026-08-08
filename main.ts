@@ -13,6 +13,7 @@ import {
 	normalizePath,
 	requestUrl,
 	FuzzySuggestModal,
+	EditorSuggest,
 } from "obsidian";
 
 // ─────────────────────────────────────────────
@@ -24,12 +25,21 @@ interface HotkeyDef {
 	key: string;         // e.g. "P"
 }
 
+interface CategorySuggestion {
+	name: string;
+	isNew: boolean;
+}
+
 interface WPPublisherSettings {
 	wpUrl: string;
 	wpUsername: string;
 	wpPassword: string;
 	defaultTemplatePath: string;
 	publishFolder: string;    // "" = any folder; otherwise restrict to this path
+	wpCategories: string;
+	wpIdCache: Record<string, string>;
+	wpContentHashCache: Record<string, string>;
+	wpSyncMigrationVersion: number;
 	autoApplyTemplateOnNewNotes: boolean;
 	syncOnSave: boolean;
 	hotkeyPublish: HotkeyDef | null;
@@ -42,6 +52,10 @@ const DEFAULT_SETTINGS: WPPublisherSettings = {
 	wpPassword: "",
 	defaultTemplatePath: "",
 	publishFolder: "",
+	wpCategories: "Blog\nNews\nProjects\nTo Do List\nUncategorized\nWrite Ups",
+	wpIdCache: {},
+	wpContentHashCache: {},
+	wpSyncMigrationVersion: 0,
 	autoApplyTemplateOnNewNotes: true,
 	syncOnSave: true,
 	hotkeyPublish: null,
@@ -53,11 +67,65 @@ const DEFAULT_WP_POST_TEMPLATE = `---
 category: 
 excerpt: 
 status: draft
+comments: off
 wp-id: 
+wp-sync: 
 ---
 `;
 
+function categoryNamesFromSettings(s: WPPublisherSettings): string[] {
+	return s.wpCategories
+		.split(/[\n,]/)
+		.map(c => c.trim())
+		.filter(Boolean);
+}
+
+function canonicalCategoryName(s: WPPublisherSettings, name: string): string {
+	const match = categoryNamesFromSettings(s).find(c => c.toLowerCase() === name.toLowerCase());
+	return match || name;
+}
+
+function unknownCategoryNames(s: WPPublisherSettings, names: string[]): string[] {
+	const known = categoryNamesFromSettings(s).map(c => c.toLowerCase());
+	return names.filter(name => !known.includes(name.toLowerCase()));
+}
+
+function mergeCategoryNames(existing: string[], incoming: string[]): string[] {
+	return Array.from(new Map(
+		[...existing, ...incoming]
+			.map(c => c.trim())
+			.filter(Boolean)
+			.map(c => [c.toLowerCase(), c])
+	).values()).sort((a, b) => a.localeCompare(b));
+}
+
+function yamlQuote(value: string): string {
+	return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function buildDefaultTemplate(s: WPPublisherSettings): string {
+	const categories = categoryNamesFromSettings(s);
+	const categoryReference = categories.length
+		? `%% Categories: ${categories.join(" · ")} %%\n\n`
+		: "";
+	return `${DEFAULT_WP_POST_TEMPLATE}${categoryReference}%%
+Ctrl + Alt + D = Draft
+Ctrl + Shift + P = Publish
+%%
+`;
+}
+
 const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+
+async function flushPendingObsidianPropertyEdit() {
+	const active = document.activeElement;
+	if (active instanceof HTMLElement) {
+		active.dispatchEvent(new Event("input", { bubbles: true }));
+		active.dispatchEvent(new Event("change", { bubbles: true }));
+		active.blur();
+		await wait(250);
+	}
+}
 
 // ─────────────────────────────────────────────
 // Hotkey helpers
@@ -212,18 +280,72 @@ function parseFrontmatter(content: string): Record<string, string> {
 	const result: Record<string, string> = {};
 	const match = content.match(/^---\n([\s\S]*?)\n---/);
 	if (!match) return result;
+	let currentListKey = "";
 	for (const line of match[1].split("\n")) {
+		const listItem = line.match(/^\s*-\s+(.+)$/);
+		if (listItem && currentListKey) {
+			const value = listItem[1].trim().replace(/^["']|["']$/g, "");
+			result[currentListKey] = result[currentListKey] ? `${result[currentListKey]}, ${value}` : value;
+			continue;
+		}
 		const idx = line.indexOf(":");
-		if (idx === -1) continue;
+		if (idx === -1) {
+			currentListKey = "";
+			continue;
+		}
 		const key = line.slice(0, idx).trim();
-		const value = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-		if (key) result[key] = value;
+		let value = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+		currentListKey = key && !value ? key : "";
+		if (/^\[.*\]$/.test(value)) {
+			value = value.slice(1, -1)
+				.split(",")
+				.map(v => v.trim().replace(/^["']|["']$/g, ""))
+				.filter(Boolean)
+				.join(", ");
+		}
+		if (key && value) result[key] = value;
 	}
 	return result;
 }
 
 function stripFrontmatter(content: string): string {
 	return content.replace(/^---\n[\s\S]*?\n---\n?/, "");
+}
+
+function stripPrivateComments(content: string): string {
+	return content.replace(/%%[\s\S]*?%%/g, "");
+}
+
+function hashString(value: string): string {
+	let hash = 5381;
+	for (let i = 0; i < value.length; i++) {
+		hash = ((hash << 5) + hash) ^ value.charCodeAt(i);
+	}
+	return (hash >>> 0).toString(16);
+}
+
+function postContentFingerprint(content: string): string {
+	const fm = parseFrontmatter(content);
+	const body = stripPrivateComments(stripFrontmatter(content)).trim();
+	const meaningfulFrontmatter = [
+		"title",
+		"category",
+		"categories",
+		"excerpt",
+		"comments",
+		"comment_status",
+	]
+		.map(key => `${key}:${(fm[key] || "").trim()}`)
+		.join("\n");
+	return hashString(`${meaningfulFrontmatter}\n---\n${body}`);
+}
+
+function getCommentStatus(fm: Record<string, string>): "open" | "closed" | null {
+	const raw = (fm["comments"] || fm["comment_status"] || "").trim().toLowerCase();
+	if (!raw) return null;
+	if (["on", "open", "enable", "enabled", "yes", "true", "allow", "allowed"].includes(raw)) return "open";
+	if (["off", "closed", "close", "disable", "disabled", "no", "false", "deny", "denied"].includes(raw)) return "closed";
+	return null;
 }
 
 async function setFrontmatterKey(app: App, file: TFile, key: string, value: string) {
@@ -247,6 +369,24 @@ async function setFrontmatterKey(app: App, file: TFile, key: string, value: stri
 		content = `---\n${key}: ${value}\n---\n${content}`;
 	}
 	// Avoid the status-sync modify loop when the value is already current.
+	if (content !== originalContent) await app.vault.modify(file, content);
+}
+
+async function deleteFrontmatterKey(app: App, file: TFile, key: string) {
+	let content = await app.vault.read(file);
+	const originalContent = content;
+	const hasFM = /^---\n/.test(content);
+	if (!hasFM) return;
+	const fmEnd = content.indexOf("\n---", 4);
+	if (fmEnd === -1) return;
+	const fmBlock = content.slice(0, fmEnd);
+	const rest = content.slice(fmEnd);
+	const lines = fmBlock.split("\n");
+	const filtered = lines.filter(line => {
+		const trimmed = line.trim();
+		return trimmed !== `${key}:` && !trimmed.startsWith(`${key}: `);
+	});
+	content = filtered.join("\n") + rest;
 	if (content !== originalContent) await app.vault.modify(file, content);
 }
 
@@ -309,7 +449,7 @@ async function resolveCategory(s: WPPublisherSettings, name: string): Promise<nu
 function categoryNamesFromFrontmatter(fm: Record<string, string>): string[] {
 	const raw = (fm["category"] || fm["categories"] || "").trim();
 	if (!raw) return [];
-	return raw.split(",").map(c => c.trim()).filter(Boolean);
+	return raw.split(",").map(c => c.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
 }
 
 async function resolveCategories(s: WPPublisherSettings, fm: Record<string, string>): Promise<number[] | undefined> {
@@ -317,8 +457,35 @@ async function resolveCategories(s: WPPublisherSettings, fm: Record<string, stri
 	// Same behavior as the Python version/readme: a blank category lets WordPress use Uncategorized.
 	if (names.length === 0) return undefined;
 	const ids: number[] = [];
-	for (const name of names) ids.push(await resolveCategory(s, name));
+	for (const name of names) ids.push(await resolveCategory(s, canonicalCategoryName(s, name)));
 	return ids;
+}
+
+async function fetchWordPressCategoryNames(s: WPPublisherSettings): Promise<string[]> {
+	const base = s.wpUrl.replace(/\/$/, "");
+	const names: string[] = [];
+	for (let page = 1; page <= 20; page++) {
+		const resp = await requestUrl({
+			url: `${base}/wp-json/wp/v2/categories?per_page=100&hide_empty=false&_fields=name&page=${page}`,
+			method: "GET",
+			headers: { Authorization: basicAuth(s.wpUsername, s.wpPassword) },
+			throw: false,
+		});
+		if (resp.status === 400 && page > 1) break;
+		if (resp.status >= 400) {
+			let msg = `HTTP ${resp.status}`;
+			try {
+				const e = resp.json;
+				if (e?.message) msg = e.message;
+				else if (e?.code) msg = e.code;
+			} catch { /**/ }
+			throw new Error(`Could not load categories (${msg})`);
+		}
+		const cats = Array.isArray(resp.json) ? resp.json as Array<{ name: string }> : [];
+		names.push(...cats.map(c => c.name).filter(Boolean));
+		if (cats.length < 100) break;
+	}
+	return mergeCategoryNames([], names);
 }
 
 async function findExistingPostByTitle(s: WPPublisherSettings, title: string): Promise<number | null> {
@@ -446,11 +613,13 @@ class FileSuggestModal extends FuzzySuggestModal<TFile> {
 
 class NewNoteModal extends Modal {
 	onSubmit: (name: string) => void;
+	suggestedName: string;
 	inputEl!: HTMLInputElement;
 
-	constructor(app: App, onSubmit: (name: string) => void) {
+	constructor(app: App, onSubmit: (name: string) => void, suggestedName = "Site Post") {
 		super(app);
 		this.onSubmit = onSubmit;
+		this.suggestedName = suggestedName;
 	}
 
 	onOpen() {
@@ -458,7 +627,8 @@ class NewNoteModal extends Modal {
 		contentEl.createEl("h3", { text: "New note from WP template" });
 		const wrap = contentEl.createDiv();
 		wrap.createEl("label", { text: "Note name:" });
-		this.inputEl = wrap.createEl("input", { type: "text", placeholder: "My new post" });
+		this.inputEl = wrap.createEl("input", { type: "text", placeholder: "Site Post" });
+		this.inputEl.value = this.suggestedName;
 		this.inputEl.style.cssText = "width:100%;margin-top:8px;padding:6px;font-size:14px;";
 
 		const btns = contentEl.createDiv();
@@ -476,11 +646,81 @@ class NewNoteModal extends Modal {
 }
 
 // ─────────────────────────────────────────────
+// Category editor suggestions
+// ─────────────────────────────────────────────
+
+class CategoryEditorSuggest extends EditorSuggest<CategorySuggestion> {
+	plugin: WPPublisherPlugin;
+
+	constructor(app: App, plugin: WPPublisherPlugin) {
+		super(app);
+		this.plugin = plugin;
+	}
+
+	onTrigger(cursor: any, editor: Editor): any {
+		const line = editor.getLine(cursor.line);
+		const beforeCursor = line.slice(0, cursor.ch);
+		const match = beforeCursor.match(/^(\s*categories?\s*:\s*)(.*)$/i);
+		if (!match) return null;
+
+		const valueBefore = match[2];
+		const tokenStart = valueBefore.lastIndexOf(",") + 1;
+		const token = valueBefore.slice(tokenStart);
+		const leadingSpaces = token.match(/^\s*/)?.[0].length ?? 0;
+		const query = token.trimStart();
+		const startCh = match[1].length + tokenStart + leadingSpaces;
+
+		return {
+			start: { line: cursor.line, ch: startCh },
+			end: cursor,
+			query,
+		};
+	}
+
+	getSuggestions(context: any): CategorySuggestion[] {
+		const categories = categoryNamesFromSettings(this.plugin.settings);
+		const query = (context.query || "").trim().toLowerCase();
+		const matches = categories
+			.filter(c => !query || c.toLowerCase().includes(query))
+			.slice(0, 25)
+			.map(name => ({ name, isNew: false }));
+
+		if (query && !categories.some(c => c.toLowerCase() === query)) {
+			matches.push({ name: context.query.trim(), isNew: true });
+		}
+		return matches;
+	}
+
+	renderSuggestion(value: CategorySuggestion, el: HTMLElement) {
+		const row = el.createDiv();
+		row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;";
+		row.createSpan({ text: value.name });
+		if (value.isNew) {
+			const badge = row.createSpan({ text: "NEW" });
+			badge.style.cssText = "font-size:10px;letter-spacing:0.04em;color:var(--text-accent);border:1px solid var(--text-accent);border-radius:4px;padding:1px 5px;";
+			badge.title = "This category is not in Known categories. WordPress will create it on publish if it does not already exist.";
+		}
+	}
+
+	selectSuggestion(value: CategorySuggestion) {
+		const context = (this as any).context;
+		if (!context) return;
+		context.editor.replaceRange(value.name, context.start, context.end);
+	}
+}
+
+// ─────────────────────────────────────────────
 // Main Plugin
 // ─────────────────────────────────────────────
 
 export default class WPPublisherPlugin extends Plugin {
 	settings!: WPPublisherSettings;
+	private hotkeyCleanups: Array<() => void> = [];
+	private internalWriteUntil: Record<string, number> = {};
+	private pendingCategoryNoticeUntil: Record<string, number> = {};
+	private pendingCategoryCreateTimers: Record<string, number> = {};
+	settingsTab?: WPPublisherSettingTab;
+	isRecordingHotkey = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -535,17 +775,58 @@ export default class WPPublisherPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "wp-migrate-sync-fields",
+			name: "Migrate published notes to WP sync tracking",
+			callback: () => this.migrateWpSyncField(),
+		});
+
+		this.addCommand({
+			id: "wp-clear-link",
+			name: "Clear WordPress link from current note",
+			editorCallback: async (_e: Editor, view: MarkdownView) => {
+				if (!view.file) return;
+				await this.forgetWpId(view.file);
+				new Notice("WP Publisher link cleared for this note.");
+			},
+		});
+
 		// Register custom hotkeys from settings
 		this.registerSavedHotkeys();
+
+		// Category suggestions from Settings → WP Publisher → Categories.
+		this.registerEditorSuggest(new CategoryEditorSuggest(this.app, this));
+		this.updateCategoryCacheNote().catch(e => console.warn("WP Publisher category cache update failed", e));
+		await this.migrateWpSyncField().catch(e => console.warn("WP Publisher wp-sync migration failed", e));
 
 		// Auto-sync on save
 		this.registerEvent(
 			this.app.vault.on("modify", async (file: TAbstractFile) => {
-				if (!this.settings.syncOnSave) return;
 				if (!(file instanceof TFile) || file.extension !== "md") return;
+				const path = normalizePath(file.path);
+				const isInternalWrite = (this.internalWriteUntil[path] || 0) > Date.now();
+				if (isInternalWrite) {
+					return;
+				}
 				const content = await this.app.vault.read(file);
 				const fm = parseFrontmatter(content);
-				if (fm["wp-id"]) await this.syncStatus(file, fm["wp-id"]);
+				const wpId = await this.resolveWpId(file, fm);
+				if (wpId) {
+					const currentHash = postContentFingerprint(content);
+					const lastSyncedHash = this.settings.wpContentHashCache[path]?.trim();
+					const currentSyncState = (fm["wp-sync"] || "").trim().toLowerCase();
+					if (!lastSyncedHash && currentSyncState === "synced") {
+						this.settings.wpContentHashCache[path] = currentHash;
+						await this.saveSettings();
+						return;
+					}
+					const nextSyncState = lastSyncedHash && currentHash === lastSyncedHash ? "synced" : "out-of-sync";
+					if (currentSyncState !== nextSyncState) {
+						await this.setPluginFrontmatterKey(file, "wp-sync", nextSyncState);
+					}
+					this.schedulePendingCategoryCreation(file);
+				}
+				if (this.settings.syncOnSave && wpId) await this.syncStatus(file, wpId);
 			})
 		);
 
@@ -559,10 +840,13 @@ export default class WPPublisherPlugin extends Plugin {
 			})
 		);
 
-		this.addSettingTab(new WPPublisherSettingTab(this.app, this));
+		this.settingsTab = new WPPublisherSettingTab(this.app, this);
+		this.addSettingTab(this.settingsTab);
 	}
 
-	onunload() {}
+	onunload() {
+		for (const timer of Object.values(this.pendingCategoryCreateTimers)) window.clearTimeout(timer);
+	}
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -572,19 +856,223 @@ export default class WPPublisherPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	async addKnownCategories(names: string[], showNotice = true) {
+		const merged = mergeCategoryNames(categoryNamesFromSettings(this.settings), names);
+		if (merged.join("\n") === categoryNamesFromSettings(this.settings).join("\n")) return;
+		this.settings.wpCategories = merged.join("\n");
+		await this.saveSettings();
+		await this.updateCategoryCacheNote();
+		this.settingsTab?.refreshCategoryList();
+		if (showNotice) new Notice(`Added to Known categories: ${names.join(", ")}`, 6000);
+	}
+
+	notifyPendingUnknownCategories(file: TFile, fm: Record<string, string>) {
+		const unknownCategories = unknownCategoryNames(this.settings, categoryNamesFromFrontmatter(fm));
+		if (unknownCategories.length === 0) return;
+		const path = normalizePath(file.path);
+		const now = Date.now();
+		if ((this.pendingCategoryNoticeUntil[path] || 0) > now) return;
+		this.pendingCategoryNoticeUntil[path] = now + 30000;
+		const statusName = (fm["status"] || "unknown").trim() || "unknown";
+		new Notice(`This post is currently ${statusName}, but this category has not been created yet: ${unknownCategories.join(", ")}. Publish or save as draft to create/update it in WordPress.`, 12000);
+	}
+
+	schedulePendingCategoryCreation(file: TFile) {
+		const path = normalizePath(file.path);
+		if (this.pendingCategoryCreateTimers[path]) {
+			window.clearTimeout(this.pendingCategoryCreateTimers[path]);
+		}
+		this.pendingCategoryCreateTimers[path] = window.setTimeout(() => {
+			delete this.pendingCategoryCreateTimers[path];
+			this.createMissingCategoriesForFile(file).catch(e => {
+				console.warn("WP Publisher category auto-create failed", e);
+				new Notice(`Category auto-create failed: ${e instanceof Error ? e.message : String(e)}`, 10000);
+			});
+		}, 1500);
+	}
+
+	async createMissingCategoriesForFile(file: TFile) {
+		const validErr = this.validateSettings();
+		await flushPendingObsidianPropertyEdit();
+		const content = await this.app.vault.read(file);
+		const fm = parseFrontmatter(content);
+		const wpId = await this.resolveWpId(file, fm);
+		if (!wpId) return;
+		const unknownCategories = unknownCategoryNames(this.settings, categoryNamesFromFrontmatter(fm));
+		if (unknownCategories.length === 0) return;
+		if (validErr) {
+			this.notifyPendingUnknownCategories(file, fm);
+			throw new Error(validErr);
+		}
+		for (const name of unknownCategories) {
+			await resolveCategory(this.settings, name);
+		}
+		await this.addKnownCategories(unknownCategories, false);
+		const statusName = (fm["status"] || "unknown").trim() || "unknown";
+		new Notice(`Created/confirmed WordPress ${unknownCategories.length === 1 ? "category" : "categories"} for ${statusName} post: ${unknownCategories.join(", ")}`, 8000);
+	}
+
+	async setPluginFrontmatterKey(file: TFile, key: string, value: string) {
+		const path = normalizePath(file.path);
+		this.internalWriteUntil[path] = Date.now() + 1500;
+		await setFrontmatterKey(this.app, file, key, value);
+	}
+
+	async migrateWpSyncField() {
+		let updated = 0;
+		const migrationVersion = this.settings.wpSyncMigrationVersion || 0;
+		const firstMigration = migrationVersion < 1;
+		const baselineMigration = migrationVersion < 3;
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const path = normalizePath(file.path);
+			const content = await this.app.vault.read(file);
+			const fm = parseFrontmatter(content);
+			const cachedId = this.settings.wpIdCache[path]?.trim();
+			const frontmatterId = (fm["wp-id"] || "").trim();
+			const syncMarker = (fm["wp-sync"] || "").trim();
+			const wpId = frontmatterId || (syncMarker ? cachedId : "");
+			if (!wpId) continue;
+			if (!cachedId && frontmatterId) {
+				this.settings.wpIdCache[path] = frontmatterId;
+			}
+			if (baselineMigration) {
+				this.settings.wpContentHashCache[path] = postContentFingerprint(content);
+			}
+			if (cachedId && frontmatterId !== cachedId) {
+				await this.setPluginFrontmatterKey(file, "wp-id", cachedId);
+			}
+			if (firstMigration || baselineMigration || !syncMarker) {
+				await this.setPluginFrontmatterKey(file, "wp-sync", "synced");
+			}
+			updated++;
+		}
+		if (baselineMigration) {
+			this.settings.wpSyncMigrationVersion = 3;
+		}
+		if (updated > 0) {
+			await this.saveSettings();
+			new Notice(`WP Publisher migrated ${updated} published note${updated === 1 ? "" : "s"} to wp-sync tracking.`);
+		} else if (baselineMigration) {
+			await this.saveSettings();
+		}
+	}
+
+	async resolveWpId(file: TFile, fm: Record<string, string>): Promise<string | null> {
+		const path = normalizePath(file.path);
+		const cached = this.settings.wpIdCache[path]?.trim();
+		const fmId = (fm["wp-id"] || "").trim();
+		const syncMarker = (fm["wp-sync"] || "").trim();
+		if (cached) {
+			if (!fmId && !syncMarker) return null;
+			if (fmId !== cached) {
+				await this.setPluginFrontmatterKey(file, "wp-id", cached);
+			}
+			return cached;
+		}
+		if (!fmId) return null;
+		this.settings.wpIdCache[path] = fmId;
+		await this.saveSettings();
+		await this.setPluginFrontmatterKey(file, "wp-id", fmId);
+		return fmId;
+	}
+
+	async storeWpId(file: TFile, wpId: string) {
+		const path = normalizePath(file.path);
+		this.settings.wpIdCache[path] = wpId;
+		await this.saveSettings();
+		await this.setPluginFrontmatterKey(file, "wp-id", wpId);
+	}
+
+	async storeSyncedContentHash(file: TFile, content: string) {
+		const path = normalizePath(file.path);
+		this.settings.wpContentHashCache[path] = postContentFingerprint(content);
+		await this.saveSettings();
+	}
+
+	async forgetWpId(file: TFile) {
+		const path = normalizePath(file.path);
+		if (this.settings.wpIdCache[path]) {
+			delete this.settings.wpIdCache[path];
+			await this.saveSettings();
+		}
+		if (this.settings.wpContentHashCache[path]) {
+			delete this.settings.wpContentHashCache[path];
+			await this.saveSettings();
+		}
+		await deleteFrontmatterKey(this.app, file, "wp-id");
+		await deleteFrontmatterKey(this.app, file, "wp-sync");
+	}
+
+	getNextSitePostPath(folder: string): string {
+		const normalizedFolder = normalizePath(folder);
+		const prefix = normalizedFolder && normalizedFolder !== "/" ? `${normalizedFolder}/` : "";
+		let index = 1;
+		while (true) {
+			const baseName = `Site Post ${index}`;
+			const path = normalizePath(`${prefix}${baseName}.md`);
+			if (!this.app.vault.getAbstractFileByPath(path)) return path;
+			index++;
+		}
+	}
+
+	async ensureFolderPath(folderPath: string) {
+		const normalized = normalizePath(folderPath);
+		if (!normalized || normalized === "/") return;
+		const parts = normalized.split("/").filter(Boolean);
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			const existing = this.app.vault.getAbstractFileByPath(current);
+			if (existing instanceof TFolder) continue;
+			if (existing) throw new Error(`Cannot create folder "${current}" because a file already exists there.`);
+			await this.app.vault.createFolder(current);
+		}
+	}
+
+
 	// ── Hotkeys registered from stored combos ──
+	async updateCategoryCacheNote() {
+		const names = Array.from(new Map(categoryNamesFromSettings(this.settings).map(c => [c.toLowerCase(), c])).values())
+			.sort((a, b) => a.localeCompare(b));
+		const templatePath = (this.settings.defaultTemplatePath || "").trim();
+		const templateFolder = templatePath
+			? templatePath.split("/").slice(0, -1).join("/")
+			: "";
+		const cacheFolder = templateFolder || (this.settings.publishFolder || "").trim() || "";
+		const cachePath = normalizePath(`${cacheFolder ? `${cacheFolder}/` : ""}WP Publisher Category Cache.md`);
+		await this.ensureFolderPath(cachePath.split("/").slice(0, -1).join("/"));
+		const yamlList = names.length
+			? names.map(name => `  - "${name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join("\n")
+			: "[]";
+		const categoryBlock = names.length ? `category:\n${yamlList}\ncategories:\n${yamlList}` : "category: []\ncategories: []";
+		const content = `---\n${categoryBlock}\nwp-publisher-internal: category-cache\n---\n# WP Publisher Category Cache\n\nThis note is maintained by WP Publisher so Obsidian's native property dropdown can suggest known WordPress categories.\n\nEdit categories in Settings -> WP Publisher -> Categories. You can ignore this note.\n`;
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const path = normalizePath(file.path);
+			if (path === cachePath) continue;
+			const current = await this.app.vault.read(file);
+			if (current.includes("wp-publisher-internal: category-cache")) {
+				await this.app.vault.delete(file);
+			}
+		}
+		const existing = this.app.vault.getAbstractFileByPath(cachePath);
+		if (existing instanceof TFile) {
+			const current = await this.app.vault.read(existing);
+			if (current !== content) await this.app.vault.modify(existing, content);
+		} else if (!existing) {
+			await this.app.vault.create(cachePath, content);
+		}
+	}
+
 	registerSavedHotkeys() {
-		// We listen globally on keydown. The Scope API needs modifiers as
-		// Obsidian Modifier[], but we can also just listen via document.
-		// Using the app's Scope is cleaner and respects modal states.
+		for (const cleanup of this.hotkeyCleanups) cleanup();
+		this.hotkeyCleanups = [];
+
+		// Listen in the capture phase so Obsidian/browser-level shortcuts like
+		// Ctrl+Shift+P do not swallow the event before WP Publisher sees it.
 		const tryHotkey = (hk: HotkeyDef | null, action: () => void) => {
 			if (!hk) return;
-			// Map our stored modifier names to Obsidian Modifier type
-			const modMap: Record<string, string> = {
-				Ctrl: "Mod", Alt: "Alt", Shift: "Shift", Meta: "Meta"
-			};
-			// Fall back to document keydown – simpler and reliable
 			const handler = (e: KeyboardEvent) => {
+				if (this.isRecordingHotkey) return;
 				const pressed = eventToHotkey(e);
 				if (!pressed) return;
 				if (
@@ -596,7 +1084,8 @@ export default class WPPublisherPlugin extends Plugin {
 					action();
 				}
 			};
-			this.registerDomEvent(document, "keydown", handler);
+			document.addEventListener("keydown", handler, true);
+			this.hotkeyCleanups.push(() => document.removeEventListener("keydown", handler, true));
 		};
 
 		tryHotkey(this.settings.hotkeyPublish, () => {
@@ -639,6 +1128,7 @@ export default class WPPublisherPlugin extends Plugin {
 			return;
 		}
 
+		await flushPendingObsidianPropertyEdit();
 		const content = await this.app.vault.read(file);
 		const fm = parseFrontmatter(content);
 		let html = mdToHtml(stripFrontmatter(content));
@@ -652,30 +1142,46 @@ export default class WPPublisherPlugin extends Plugin {
 			status: desiredStatus,
 			excerpt: fm["excerpt"] || "",
 		};
+		const commentStatus = getCommentStatus(fm);
+		if (commentStatus) payload["comment_status"] = commentStatus;
 
 		const previousStatus = (fm["status"] || "").trim().toLowerCase();
 		try {
+			const unknownCategories = unknownCategoryNames(this.settings, categoryNamesFromFrontmatter(fm));
+			if (unknownCategories.length > 0) {
+				new Notice(`Not in Known categories; WordPress will create if missing: ${unknownCategories.join(", ")}`, 8000);
+			}
 			const categoryIds = await resolveCategories(this.settings, fm);
 			if (categoryIds) payload["categories"] = categoryIds;
 
-			const existingId = fm["wp-id"] || await findExistingPostByTitle(this.settings, title);
+			const existingId = await this.resolveWpId(file, fm) || await findExistingPostByTitle(this.settings, title);
 			let post: WPPost;
 			if (existingId) {
 				post = await wpRequest(this.settings, "POST", `posts/${existingId}`, payload);
-				await setFrontmatterKey(this.app, file, "wp-id", String(post.id));
+				await this.storeWpId(file, String(post.id));
 				const msg = desiredStatus === "draft"
 					? (previousStatus === "publish" ? "Taken down to draft" : "Draft updated")
 					: (previousStatus === "draft" ? "Published from draft" : "Post updated");
 				new Notice(`✅ ${msg}: "${title}"`);
 			} else {
 				post = await wpRequest(this.settings, "POST", "posts", payload);
-				await setFrontmatterKey(this.app, file, "wp-id", String(post.id));
+				await this.storeWpId(file, String(post.id));
 				new Notice(desiredStatus === "publish" ? `✅ Published: "${title}"` : `✅ Saved as new draft: "${title}"`);
 			}
-			await setFrontmatterKey(this.app, file, "status", post.status);
+			if (unknownCategories.length > 0) {
+				try {
+					await this.addKnownCategories(unknownCategories);
+				} catch (categoryUpdateError) {
+					console.warn("WP Publisher could not update Known categories after publish", categoryUpdateError);
+					new Notice("Post succeeded, but WP Publisher could not refresh Known categories. Reload or use Load from WordPress.", 10000);
+				}
+			}
+			await this.storeSyncedContentHash(file, content);
+			await this.setPluginFrontmatterKey(file, "status", post.status);
+			await this.setPluginFrontmatterKey(file, "wp-sync", "synced");
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
-			await setFrontmatterKey(this.app, file, "status", "error");
+			await this.setPluginFrontmatterKey(file, "status", "error");
 			new Notice(`⛔ Publish failed: ${msg}`, 10000);
 		}
 	}
@@ -686,10 +1192,11 @@ export default class WPPublisherPlugin extends Plugin {
 		if (err) { new Notice(`⛔ ${err}`, 8000); return; }
 		const content = await this.app.vault.read(file);
 		const fm = parseFrontmatter(content);
-		if (!fm["wp-id"]) { new Notice("⛔ This note hasn't been published yet (no wp-id)."); return; }
+		const wpId = await this.resolveWpId(file, fm);
+		if (!wpId) { new Notice("⛔ This note hasn't been published yet (no wp-id)."); return; }
 		try {
-			await wpRequest(this.settings, "POST", `posts/${fm["wp-id"]}`, { status: "draft" });
-			await setFrontmatterKey(this.app, file, "status", "draft");
+			await wpRequest(this.settings, "POST", `posts/${wpId}`, { status: "draft" });
+			await this.setPluginFrontmatterKey(file, "status", "draft");
 			new Notice(`✅ Reverted to draft: "${fm["title"] || file.basename}"`);
 		} catch (e: unknown) {
 			new Notice(`⛔ Revert failed: ${e instanceof Error ? e.message : String(e)}`, 10000);
@@ -700,14 +1207,14 @@ export default class WPPublisherPlugin extends Plugin {
 	async syncStatus(file: TFile, wpId: string) {
 		try {
 			const post = await wpRequest(this.settings, "GET", `posts/${wpId}`);
-			await setFrontmatterKey(this.app, file, "status", post.status);
+			await this.setPluginFrontmatterKey(file, "status", post.status);
 		} catch { /**/ }
 	}
 
 	// ── Template helpers ──
 	async getTemplateContent(): Promise<string> {
 		const templatePath = this.settings.defaultTemplatePath.trim();
-		if (!templatePath) return DEFAULT_WP_POST_TEMPLATE;
+		if (!templatePath) return buildDefaultTemplate(this.settings);
 		const templateFile = this.app.vault.getAbstractFileByPath(normalizePath(templatePath));
 		if (!(templateFile instanceof TFile)) {
 			throw new Error(`Template note not found: "${templatePath}". Check the path in Settings → WP Publisher.`);
@@ -725,11 +1232,13 @@ export default class WPPublisherPlugin extends Plugin {
 			return;
 		}
 
+		const folder = this.settings.publishFolder.trim();
+		const suggestedName = this.getNextSitePostPath(folder).split("/").pop()?.replace(/\.md$/i, "") || "Site Post";
+
 		new NewNoteModal(this.app, async (noteName: string) => {
 			if (!noteName.trim()) { new Notice("Note name cannot be empty."); return; }
 
 			// Place new note in the publish folder if one is set, otherwise vault root
-			const folder = this.settings.publishFolder.trim();
 			const fileName = noteName.endsWith(".md") ? noteName : `${noteName}.md`;
 			const newPath = normalizePath(folder && folder !== "/" ? `${folder}/${fileName}` : fileName);
 
@@ -740,7 +1249,7 @@ export default class WPPublisherPlugin extends Plugin {
 			} catch (e: unknown) {
 				new Notice(`⛔ Could not create note: ${e instanceof Error ? e.message : String(e)}`, 8000);
 			}
-		}).open();
+		}, suggestedName).open();
 	}
 
 	async applyTemplateToCurrentNote(file: TFile) {
@@ -773,13 +1282,24 @@ export default class WPPublisherPlugin extends Plugin {
 			const existing = await this.app.vault.read(file);
 			if (existing.trim().length > 0) return;
 
+			let targetFile = file;
+			if (/^Untitled(?: \d+)?$/i.test(file.basename)) {
+				const newPath = this.getNextSitePostPath(folder);
+				if (newPath !== file.path) {
+					await this.app.fileManager.renameFile(file, newPath);
+					const moved = this.app.vault.getAbstractFileByPath(newPath);
+					if (moved instanceof TFile) targetFile = moved;
+				}
+			}
+
 			const templateContent = await this.getTemplateContent();
-			await this.app.vault.modify(file, templateContent.trimEnd() + "\n");
-			new Notice(`✅ WP template applied to new post note: "${file.basename}".`);
+			await this.app.vault.modify(targetFile, templateContent.trimEnd() + "\n");
+			new Notice(`WP template applied to new post note: "${targetFile.basename}".`);
 		} catch (e: unknown) {
-			new Notice(`⛔ Could not auto-apply WP template: ${e instanceof Error ? e.message : String(e)}`, 10000);
+			new Notice(`Could not auto-apply WP template: ${e instanceof Error ? e.message : String(e)}`, 10000);
 		}
 	}
+
 }
 
 // ─────────────────────────────────────────────
@@ -788,15 +1308,23 @@ export default class WPPublisherPlugin extends Plugin {
 
 class WPPublisherSettingTab extends PluginSettingTab {
 	plugin: WPPublisherPlugin;
+	categoryTextAreaEl?: HTMLTextAreaElement;
 
 	constructor(app: App, plugin: WPPublisherPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
 
+	refreshCategoryList() {
+		if (this.categoryTextAreaEl && this.categoryTextAreaEl.value !== this.plugin.settings.wpCategories) {
+			this.categoryTextAreaEl.value = this.plugin.settings.wpCategories;
+		}
+	}
+
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+		this.plugin.updateCategoryCacheNote().catch(e => console.warn("WP Publisher category cache update failed", e));
 
 		// ── WordPress Connection ──────────────────────────────────
 		containerEl.createEl("h2", { text: `WordPress connection — Hermes ${HERMES_PLUGIN_VERSION}` });
@@ -955,14 +1483,6 @@ class WPPublisherSettingTab extends PluginSettingTab {
 				);
 		}
 
-		new Setting(containerEl)
-			.setName("Sync status on save")
-			.setDesc("Silently update status: in frontmatter whenever you save a note that has a wp-id.")
-			.addToggle(t => t
-				.setValue(this.plugin.settings.syncOnSave)
-				.onChange(async v => { this.plugin.settings.syncOnSave = v; await this.plugin.saveSettings(); })
-			);
-
 		// ── Template ─────────────────────────────────────────────
 		containerEl.createEl("h2", { text: "Template" });
 
@@ -1003,10 +1523,81 @@ class WPPublisherSettingTab extends PluginSettingTab {
 				})
 			);
 
+
+		new Setting(containerEl)
+			.setName("Sync status on save")
+			.setDesc("Silently update status: in frontmatter whenever you save a note with a plugin-managed wp-id.")
+			.addToggle(t => t
+				.setValue(this.plugin.settings.syncOnSave)
+				.onChange(async v => { this.plugin.settings.syncOnSave = v; await this.plugin.saveSettings(); })
+			);
+
+		// ── Categories ───────────────────────────────────────────
+		containerEl.createEl("h2", { text: "Categories" });
+		containerEl.createEl("p", {
+			text: "Add known WordPress categories here. Put each category on its own line, or separate categories with commas. If a category in note frontmatter does not exist in WordPress yet, WP Publisher will create it automatically when publishing.",
+		}).style.cssText = "font-size:13px;color:var(--text-muted);margin-bottom:8px;";
+
+		const categorySetting = new Setting(containerEl)
+			.setName("Known categories")
+			.setDesc("Used for category suggestions while typing category: or categories: in note frontmatter.")
+			.addTextArea(t => {
+				t.setPlaceholder("Blog\nNews\nProjects")
+					.setValue(this.plugin.settings.wpCategories)
+					.onChange(async v => {
+						this.plugin.settings.wpCategories = v;
+						await this.plugin.saveSettings();
+						await this.plugin.updateCategoryCacheNote();
+						this.refreshCategoryList();
+					});
+				t.inputEl.rows = 6;
+				t.inputEl.style.width = "100%";
+				t.inputEl.style.minWidth = "360px";
+				t.inputEl.style.resize = "vertical";
+				this.categoryTextAreaEl = t.inputEl;
+			})
+			.addButton(btn => btn
+				.setButtonText("?")
+				.setTooltip("Category list format")
+				.onClick(() => {
+					new Notice("Use one category per line or separate them with commas. If a note is published or drafted and the category is not in the list, the category is created automatically in WordPress.", 12000);
+				})
+			)
+			.addButton(btn => btn
+				.setButtonText("Refresh from WordPress")
+				.setTooltip("Replace Known categories with the current WordPress category list.")
+				.onClick(async () => {
+					const validErr = this.plugin.validateSettings();
+					if (validErr) { new Notice(`⛔ ${validErr}`, 8000); return; }
+					try {
+						const loaded = await fetchWordPressCategoryNames(this.plugin.settings);
+						const merged = mergeCategoryNames([], loaded);
+						this.plugin.settings.wpCategories = merged.join("\n");
+						await this.plugin.saveSettings();
+						await this.plugin.updateCategoryCacheNote();
+						this.refreshCategoryList();
+						new Notice(`✅ Loaded ${loaded.length} categories from WordPress.`);
+						this.display();
+					} catch (e: unknown) {
+						new Notice(`⛔ Category load failed: ${e instanceof Error ? e.message : String(e)}`, 10000);
+					}
+				})
+			);
+		categorySetting.settingEl.style.alignItems = "stretch";
+		categorySetting.infoEl.style.alignSelf = "flex-start";
+		categorySetting.controlEl.style.flexDirection = "column";
+		categorySetting.controlEl.style.alignItems = "stretch";
+		categorySetting.controlEl.style.gap = "8px";
+
+		const categoryButtonRow = categorySetting.controlEl.createDiv();
+		categoryButtonRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+		const categoryButtons = Array.from(categorySetting.controlEl.querySelectorAll("button"));
+		for (const button of categoryButtons) categoryButtonRow.appendChild(button);
+
 		// ── Hotkeys ──────────────────────────────────────────────
 		containerEl.createEl("h2", { text: "Hotkeys" });
 		containerEl.createEl("p", {
-			text: "Click a record button, then press your desired key combination (must include Ctrl, Alt, Shift, or Meta). Press Escape to cancel recording.",
+			text: "Click Record, press your desired key combination, then click Stop recording to save it. Press Escape to cancel recording.",
 		}).style.cssText = "font-size:13px;color:var(--text-muted);margin-bottom:12px;";
 
 		this.addHotkeySetting(containerEl, "Publish hotkey", "hotkeyPublish");
@@ -1025,8 +1616,10 @@ class WPPublisherSettingTab extends PluginSettingTab {
 			<code>title:</code> — optional override; by default the post title comes from the note filename<br>
 			<code>category:</code> — WordPress category (auto-created if new; blank uses WordPress Uncategorized)<br>
 			<code>excerpt:</code> — post summary / meta description<br>
+			<code>comments:</code> — <code>on</code> or <code>off</code>; sends WordPress comment_status open/closed for anti-bot control<br>
 			<code>status:</code> — updated automatically by the plugin<br>
-			<code>wp-id:</code> — written automatically after first publish<br>
+			<code>wp-id:</code> — visible publish marker, managed automatically by WP Publisher<br>
+			<code>wp-sync:</code> — <code>synced</code> after publish/draft; <code>out-of-sync</code> after local edits<br>
 		`;
 	}
 
@@ -1059,61 +1652,86 @@ class WPPublisherSettingTab extends PluginSettingTab {
 		display.textContent = hotkeyLabel(current);
 
 		let recording = false;
-		let keydownHandler: ((e: KeyboardEvent) => void) | null = null;
+		let pendingHotkey: HotkeyDef | null = null;
+		let keyHandler: ((e: KeyboardEvent) => void) | null = null;
 
-		const stopRecording = () => {
+		const detachRecorder = () => {
 			recording = false;
-			recordBtn.textContent = "Record";
+			this.plugin.isRecordingHotkey = false;
 			recordBtn.classList.remove("mod-warning");
-			if (keydownHandler) {
-				document.removeEventListener("keydown", keydownHandler, true);
-				keydownHandler = null;
+			if (keyHandler) {
+				document.removeEventListener("keydown", keyHandler, true);
+				document.removeEventListener("keyup", keyHandler, true);
+				window.removeEventListener("keydown", keyHandler, true);
+				window.removeEventListener("keyup", keyHandler, true);
+				keyHandler = null;
 			}
+		};
+
+		const savePendingHotkey = async () => {
+			detachRecorder();
+			recordBtn.textContent = "Record";
+			if (!pendingHotkey) return;
+			this.plugin.settings[settingKey] = pendingHotkey;
+			await this.plugin.saveSettings();
+			this.plugin.registerSavedHotkeys();
+			display.textContent = hotkeyLabel(pendingHotkey);
+			new Notice(`✅ ${label} set to ${hotkeyLabel(pendingHotkey)}`);
+			pendingHotkey = null;
 		};
 
 		// Record button
 		const recordBtn = row.controlEl.createEl("button", { text: "Record" });
 		recordBtn.style.marginLeft = "8px";
-		recordBtn.onclick = () => {
-			if (recording) { stopRecording(); return; }
+		recordBtn.onclick = async () => {
+			if (recording) { await savePendingHotkey(); return; }
 			recording = true;
-			recordBtn.textContent = "Press keys… (Esc to cancel)";
+			pendingHotkey = null;
+			this.plugin.isRecordingHotkey = true;
+			recordBtn.textContent = "Stop recording";
 			recordBtn.classList.add("mod-warning");
+			display.textContent = "Press keybind…";
 
-			keydownHandler = (e: KeyboardEvent) => {
-				e.preventDefault();
-				e.stopPropagation();
-
+			keyHandler = (e: KeyboardEvent) => {
 				if (e.key === "Escape") {
-					stopRecording();
+					e.preventDefault();
+					e.stopPropagation();
+					e.stopImmediatePropagation();
+					pendingHotkey = null;
+					display.textContent = hotkeyLabel(this.plugin.settings[settingKey]);
+					detachRecorder();
+					recordBtn.textContent = "Record";
 					return;
 				}
 
 				const hk = eventToHotkey(e);
 				if (!hk) return; // bare modifier, keep waiting
+				e.preventDefault();
+				e.stopPropagation();
+				e.stopImmediatePropagation();
 
-				stopRecording();
-				this.plugin.settings[settingKey] = hk;
-				this.plugin.saveSettings();
+				pendingHotkey = hk;
 				display.textContent = hotkeyLabel(hk);
-
-				// Re-register hotkeys so the new combo is live immediately
-				// (requires plugin reload to cleanly remove old listener, but
-				//  the new one is added immediately)
-				new Notice(`✅ ${label} set to ${hotkeyLabel(hk)}\nRestart Obsidian to remove any old binding.`);
 			};
 
-			document.addEventListener("keydown", keydownHandler, true);
+			document.addEventListener("keydown", keyHandler, true);
+			document.addEventListener("keyup", keyHandler, true);
+			window.addEventListener("keydown", keyHandler, true);
+			window.addEventListener("keyup", keyHandler, true);
 		};
 
 		// Clear button
 		const clearBtn = row.controlEl.createEl("button", { text: "Clear" });
 		clearBtn.style.marginLeft = "6px";
 		clearBtn.onclick = async () => {
-			stopRecording();
+			detachRecorder();
+			recordBtn.textContent = "Record";
+			pendingHotkey = null;
 			this.plugin.settings[settingKey] = null;
 			await this.plugin.saveSettings();
+			this.plugin.registerSavedHotkeys();
 			display.textContent = hotkeyLabel(null);
 		};
 	}
 }
+

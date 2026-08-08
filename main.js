@@ -34,6 +34,10 @@ var DEFAULT_SETTINGS = {
   wpPassword: "",
   defaultTemplatePath: "",
   publishFolder: "",
+  wpCategories: "Blog\nNews\nProjects\nTo Do List\nUncategorized\nWrite Ups",
+  wpIdCache: {},
+  wpContentHashCache: {},
+  wpSyncMigrationVersion: 0,
   autoApplyTemplateOnNewNotes: true,
   syncOnSave: true,
   hotkeyPublish: null,
@@ -44,10 +48,49 @@ var DEFAULT_WP_POST_TEMPLATE = `---
 category: 
 excerpt: 
 status: draft
+comments: off
 wp-id: 
+wp-sync: 
 ---
 `;
+function categoryNamesFromSettings(s) {
+  return s.wpCategories.split(/[\n,]/).map((c) => c.trim()).filter(Boolean);
+}
+function canonicalCategoryName(s, name) {
+  const match = categoryNamesFromSettings(s).find((c) => c.toLowerCase() === name.toLowerCase());
+  return match || name;
+}
+function unknownCategoryNames(s, names) {
+  const known = categoryNamesFromSettings(s).map((c) => c.toLowerCase());
+  return names.filter((name) => !known.includes(name.toLowerCase()));
+}
+function mergeCategoryNames(existing, incoming) {
+  return Array.from(new Map([...existing, ...incoming].map((c) => c.trim()).filter(Boolean).map((c) => [c.toLowerCase(), c])).values()).sort((a, b) => a.localeCompare(b));
+}
+function yamlQuote(value) {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+function buildDefaultTemplate(s) {
+  const categories = categoryNamesFromSettings(s);
+  const categoryReference = categories.length ? `%% Categories: ${categories.join(" \xB7 ")} %%
+
+` : "";
+  return `${DEFAULT_WP_POST_TEMPLATE}${categoryReference}%%
+Ctrl + Alt + D = Draft
+Ctrl + Shift + P = Publish
+%%
+`;
+}
 var wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+async function flushPendingObsidianPropertyEdit() {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement) {
+    active.dispatchEvent(new Event("input", { bubbles: true }));
+    active.dispatchEvent(new Event("change", { bubbles: true }));
+    active.blur();
+    await wait(250);
+  }
+}
 function hotkeyLabel(hk) {
   if (!hk) return "Not set";
   const parts = [...hk.modifiers, hk.key];
@@ -200,17 +243,54 @@ function parseFrontmatter(content) {
   const result = {};
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return result;
+  let currentListKey = "";
   for (const line of match[1].split("\n")) {
+    const listItem = line.match(/^\s*-\s+(.+)$/);
+    if (listItem && currentListKey) {
+      const value2 = listItem[1].trim().replace(/^["']|["']$/g, "");
+      result[currentListKey] = result[currentListKey] ? `${result[currentListKey]}, ${value2}` : value2;
+      continue;
+    }
     const idx = line.indexOf(":");
-    if (idx === -1) continue;
+    if (idx === -1) {
+      currentListKey = "";
+      continue;
+    }
     const key = line.slice(0, idx).trim();
-    const value = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-    if (key) result[key] = value;
+    let value = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+    currentListKey = key && !value ? key : "";
+    if (/^\[.*\]$/.test(value)) {
+      value = value.slice(1, -1).split(",").map((v) => v.trim().replace(/^["']|["']$/g, "")).filter(Boolean).join(", ");
+    }
+    if (key && value) result[key] = value;
   }
   return result;
 }
 function stripFrontmatter(content) {
   return content.replace(/^---\n[\s\S]*?\n---\n?/, "");
+}
+function stripPrivateComments(content) {
+  return content.replace(/%%[\s\S]*?%%/g, "");
+}
+function hashString(value) {
+  let hash = 5381;
+  for (let i = 0; i < value.length; i++) {
+    hash = (hash << 5) + hash ^ value.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16);
+}
+function postContentFingerprint(content) {
+  const fm = parseFrontmatter(content);
+  const body = stripPrivateComments(stripFrontmatter(content)).trim();
+  const meaningfulFrontmatter = ["title", "category", "categories", "excerpt", "comments", "comment_status"].map((key) => `${key}:${(fm[key] || "").trim()}`).join("\n");
+  return hashString(`${meaningfulFrontmatter}\n---\n${body}`);
+}
+function getCommentStatus(fm) {
+  const raw = (fm["comments"] || fm["comment_status"] || "").trim().toLowerCase();
+  if (!raw) return null;
+  if (["on", "open", "enable", "enabled", "yes", "true", "allow", "allowed"].includes(raw)) return "open";
+  if (["off", "closed", "close", "disable", "disabled", "no", "false", "deny", "denied"].includes(raw)) return "closed";
+  return null;
 }
 async function setFrontmatterKey(app, file, key, value) {
   let content = await app.vault.read(file);
@@ -234,6 +314,21 @@ ${key}: ${value}
 ---
 ${content}`;
   }
+  if (content !== originalContent) await app.vault.modify(file, content);
+}
+async function deleteFrontmatterKey(app, file, key) {
+  let content = await app.vault.read(file);
+  const originalContent = content;
+  const hasFM = /^---\n/.test(content);
+  if (!hasFM) return;
+  const fmEnd = content.indexOf("\n---", 4);
+  if (fmEnd === -1) return;
+  const fmBlock = content.slice(0, fmEnd);
+  const rest = content.slice(fmEnd);
+  const keyRegex = new RegExp(`^${key}:[\\t ]*.*(?:\\n|$)`, "m");
+  if (!keyRegex.test(fmBlock)) return;
+  const newFmBlock = fmBlock.replace(keyRegex, "").replace(/\n{3,}/g, "\n\n").replace(/\n$/, "");
+  content = `${newFmBlock}${rest}`;
   if (content !== originalContent) await app.vault.modify(file, content);
 }
 function basicAuth(u, p) {
@@ -289,14 +384,41 @@ async function resolveCategory(s, name) {
 function categoryNamesFromFrontmatter(fm) {
   const raw = (fm["category"] || fm["categories"] || "").trim();
   if (!raw) return [];
-  return raw.split(",").map((c) => c.trim()).filter(Boolean);
+  return raw.split(",").map((c) => c.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
 }
 async function resolveCategories(s, fm) {
   const names = categoryNamesFromFrontmatter(fm);
   if (names.length === 0) return void 0;
   const ids = [];
-  for (const name of names) ids.push(await resolveCategory(s, name));
+  for (const name of names) ids.push(await resolveCategory(s, canonicalCategoryName(s, name)));
   return ids;
+}
+async function fetchWordPressCategoryNames(s) {
+  const base = s.wpUrl.replace(/\/$/, "");
+  const names = [];
+  for (let page = 1; page <= 20; page++) {
+    const resp = await (0, import_obsidian.requestUrl)({
+      url: `${base}/wp-json/wp/v2/categories?per_page=100&hide_empty=false&_fields=name&page=${page}`,
+      method: "GET",
+      headers: { Authorization: basicAuth(s.wpUsername, s.wpPassword) },
+      throw: false
+    });
+    if (resp.status === 400 && page > 1) break;
+    if (resp.status >= 400) {
+      let msg = `HTTP ${resp.status}`;
+      try {
+        const e = resp.json;
+        if (e == null ? void 0 : e.message) msg = e.message;
+        else if (e == null ? void 0 : e.code) msg = e.code;
+      } catch {
+      }
+      throw new Error(`Could not load categories (${msg})`);
+    }
+    const cats = Array.isArray(resp.json) ? resp.json : [];
+    names.push(...cats.map((c) => c.name).filter(Boolean));
+    if (cats.length < 100) break;
+  }
+  return mergeCategoryNames([], names);
 }
 async function findExistingPostByTitle(s, title) {
   var _a;
@@ -408,16 +530,18 @@ var FileSuggestModal = class extends import_obsidian.FuzzySuggestModal {
   }
 };
 var NewNoteModal = class extends import_obsidian.Modal {
-  constructor(app, onSubmit) {
+  constructor(app, onSubmit, suggestedName = "Site Post") {
     super(app);
     this.onSubmit = onSubmit;
+    this.suggestedName = suggestedName;
   }
   onOpen() {
     const { contentEl } = this;
     contentEl.createEl("h3", { text: "New note from WP template" });
     const wrap = contentEl.createDiv();
     wrap.createEl("label", { text: "Note name:" });
-    this.inputEl = wrap.createEl("input", { type: "text", placeholder: "My new post" });
+    this.inputEl = wrap.createEl("input", { type: "text", placeholder: "Site Post" });
+    this.inputEl.value = this.suggestedName;
     this.inputEl.style.cssText = "width:100%;margin-top:8px;padding:6px;font-size:14px;";
     const btns = contentEl.createDiv();
     btns.style.cssText = "display:flex;gap:8px;margin-top:16px;justify-content:flex-end;";
@@ -439,7 +563,63 @@ var NewNoteModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
+var CategoryEditorSuggest = class extends import_obsidian.EditorSuggest {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+  onTrigger(cursor, editor) {
+    var _a;
+    const line = editor.getLine(cursor.line);
+    const beforeCursor = line.slice(0, cursor.ch);
+    const match = beforeCursor.match(/^(\s*categories?\s*:\s*)(.*)$/i);
+    if (!match) return null;
+    const valueBefore = match[2];
+    const tokenStart = valueBefore.lastIndexOf(",") + 1;
+    const token = valueBefore.slice(tokenStart);
+    const leadingSpaces = (_a = token.match(/^\s*/)) == null ? void 0 : _a[0].length;
+    const query = token.trimStart();
+    const startCh = match[1].length + tokenStart + (leadingSpaces != null ? leadingSpaces : 0);
+    return {
+      start: { line: cursor.line, ch: startCh },
+      end: cursor,
+      query
+    };
+  }
+  getSuggestions(context) {
+    const categories = categoryNamesFromSettings(this.plugin.settings);
+    const query = (context.query || "").trim().toLowerCase();
+    const matches = categories.filter((c) => !query || c.toLowerCase().includes(query)).slice(0, 25).map((name) => ({ name, isNew: false }));
+    if (query && !categories.some((c) => c.toLowerCase() === query)) {
+      matches.push({ name: context.query.trim(), isNew: true });
+    }
+    return matches;
+  }
+  renderSuggestion(value, el) {
+    const row = el.createDiv();
+    row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;";
+    row.createSpan({ text: value.name });
+    if (value.isNew) {
+      const badge = row.createSpan({ text: "NEW" });
+      badge.style.cssText = "font-size:10px;letter-spacing:0.04em;color:var(--text-accent);border:1px solid var(--text-accent);border-radius:4px;padding:1px 5px;";
+      badge.title = "This category is not in Known categories. WordPress will create it on publish if it does not already exist.";
+    }
+  }
+  selectSuggestion(value) {
+    const context = this.context;
+    if (!context) return;
+    context.editor.replaceRange(value.name, context.start, context.end);
+  }
+};
 var WPPublisherPlugin = class extends import_obsidian.Plugin {
+  constructor() {
+    super(...arguments);
+    this.hotkeyCleanups = [];
+    this.internalWriteUntil = {};
+    this.pendingCategoryNoticeUntil = {};
+    this.pendingCategoryCreateTimers = {};
+    this.isRecordingHotkey = false;
+  }
   async onload() {
     await this.loadSettings();
     this.addRibbonIcon("upload-cloud", "Publish to WordPress", () => {
@@ -480,14 +660,51 @@ var WPPublisherPlugin = class extends import_obsidian.Plugin {
         if (view.file) this.applyTemplateToCurrentNote(view.file);
       }
     });
+    this.addCommand({
+      id: "wp-migrate-sync-fields",
+      name: "Migrate published notes to WP sync tracking",
+      callback: () => this.migrateWpSyncField()
+    });
+    this.addCommand({
+      id: "wp-clear-link",
+      name: "Clear WordPress link from current note",
+      editorCallback: async (_e, view) => {
+        if (!view.file) return;
+        await this.forgetWpId(view.file);
+        new import_obsidian.Notice("WP Publisher link cleared for this note.");
+      }
+    });
     this.registerSavedHotkeys();
+    this.registerEditorSuggest(new CategoryEditorSuggest(this.app, this));
+    this.updateCategoryCacheNote().catch((e) => console.warn("WP Publisher category cache update failed", e));
+    await this.migrateWpSyncField().catch((e) => console.warn("WP Publisher wp-sync migration failed", e));
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
-        if (!this.settings.syncOnSave) return;
         if (!(file instanceof import_obsidian.TFile) || file.extension !== "md") return;
+        const path = (0, import_obsidian.normalizePath)(file.path);
+        const isInternalWrite = (this.internalWriteUntil[path] || 0) > Date.now();
+        if (isInternalWrite) {
+          return;
+        }
         const content = await this.app.vault.read(file);
         const fm = parseFrontmatter(content);
-        if (fm["wp-id"]) await this.syncStatus(file, fm["wp-id"]);
+        const wpId = await this.resolveWpId(file, fm);
+        if (wpId) {
+          const currentHash = postContentFingerprint(content);
+          const lastSyncedHash = (this.settings.wpContentHashCache[path] || "").trim();
+          const currentSyncState = (fm["wp-sync"] || "").trim().toLowerCase();
+          if (!lastSyncedHash && currentSyncState === "synced") {
+            this.settings.wpContentHashCache[path] = currentHash;
+            await this.saveSettings();
+            return;
+          }
+          const nextSyncState = lastSyncedHash && currentHash === lastSyncedHash ? "synced" : "out-of-sync";
+          if (currentSyncState !== nextSyncState) {
+            await this.setPluginFrontmatterKey(file, "wp-sync", nextSyncState);
+          }
+          this.schedulePendingCategoryCreation(file);
+        }
+        if (this.settings.syncOnSave && wpId) await this.syncStatus(file, wpId);
       })
     );
     this.registerEvent(
@@ -496,9 +713,11 @@ var WPPublisherPlugin = class extends import_obsidian.Plugin {
         await this.autoApplyTemplateToNewNote(file);
       })
     );
-    this.addSettingTab(new WPPublisherSettingTab(this.app, this));
+    this.settingsTab = new WPPublisherSettingTab(this.app, this);
+    this.addSettingTab(this.settingsTab);
   }
   onunload() {
+    for (const timer of Object.values(this.pendingCategoryCreateTimers)) window.clearTimeout(timer);
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -506,17 +725,213 @@ var WPPublisherPlugin = class extends import_obsidian.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
+  async addKnownCategories(names, showNotice = true) {
+    const merged = mergeCategoryNames(categoryNamesFromSettings(this.settings), names);
+    if (merged.join("\n") === categoryNamesFromSettings(this.settings).join("\n")) return;
+    this.settings.wpCategories = merged.join("\n");
+    await this.saveSettings();
+    await this.updateCategoryCacheNote();
+    this.settingsTab?.refreshCategoryList();
+    if (showNotice) new import_obsidian.Notice(`Added to Known categories: ${names.join(", ")}`, 6e3);
+  }
+  notifyPendingUnknownCategories(file, fm) {
+    const unknownCategories = unknownCategoryNames(this.settings, categoryNamesFromFrontmatter(fm));
+    if (unknownCategories.length === 0) return;
+    const path = (0, import_obsidian.normalizePath)(file.path);
+    const now = Date.now();
+    if ((this.pendingCategoryNoticeUntil[path] || 0) > now) return;
+    this.pendingCategoryNoticeUntil[path] = now + 3e4;
+    const statusName = (fm["status"] || "unknown").trim() || "unknown";
+    new import_obsidian.Notice(`This post is currently ${statusName}, but this category has not been created yet: ${unknownCategories.join(", ")}. Publish or save as draft to create/update it in WordPress.`, 12e3);
+  }
+  schedulePendingCategoryCreation(file) {
+    const path = (0, import_obsidian.normalizePath)(file.path);
+    if (this.pendingCategoryCreateTimers[path]) {
+      window.clearTimeout(this.pendingCategoryCreateTimers[path]);
+    }
+    this.pendingCategoryCreateTimers[path] = window.setTimeout(() => {
+      delete this.pendingCategoryCreateTimers[path];
+      this.createMissingCategoriesForFile(file).catch((e) => {
+        console.warn("WP Publisher category auto-create failed", e);
+        new import_obsidian.Notice(`Category auto-create failed: ${e instanceof Error ? e.message : String(e)}`, 1e4);
+      });
+    }, 1500);
+  }
+  async createMissingCategoriesForFile(file) {
+    const validErr = this.validateSettings();
+    await flushPendingObsidianPropertyEdit();
+    const content = await this.app.vault.read(file);
+    const fm = parseFrontmatter(content);
+    const wpId = await this.resolveWpId(file, fm);
+    if (!wpId) return;
+    const unknownCategories = unknownCategoryNames(this.settings, categoryNamesFromFrontmatter(fm));
+    if (unknownCategories.length === 0) return;
+    if (validErr) {
+      this.notifyPendingUnknownCategories(file, fm);
+      throw new Error(validErr);
+    }
+    for (const name of unknownCategories) {
+      await resolveCategory(this.settings, name);
+    }
+    await this.addKnownCategories(unknownCategories, false);
+    const statusName = (fm["status"] || "unknown").trim() || "unknown";
+    new import_obsidian.Notice(`Created/confirmed WordPress ${unknownCategories.length === 1 ? "category" : "categories"} for ${statusName} post: ${unknownCategories.join(", ")}`, 8e3);
+  }
+  async setPluginFrontmatterKey(file, key, value) {
+    const path = (0, import_obsidian.normalizePath)(file.path);
+    this.internalWriteUntil[path] = Date.now() + 1500;
+    await setFrontmatterKey(this.app, file, key, value);
+  }
+  async migrateWpSyncField() {
+    let updated = 0;
+    const migrationVersion = this.settings.wpSyncMigrationVersion || 0;
+    const firstMigration = migrationVersion < 1;
+    const baselineMigration = migrationVersion < 3;
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const path = (0, import_obsidian.normalizePath)(file.path);
+      const content = await this.app.vault.read(file);
+      const fm = parseFrontmatter(content);
+      const cachedId = (this.settings.wpIdCache[path] || "").trim();
+      const frontmatterId = (fm["wp-id"] || "").trim();
+      const syncMarker = (fm["wp-sync"] || "").trim();
+      const wpId = frontmatterId || (syncMarker ? cachedId : "");
+      if (!wpId) continue;
+      if (!cachedId && frontmatterId) {
+        this.settings.wpIdCache[path] = frontmatterId;
+      }
+      if (baselineMigration) {
+        this.settings.wpContentHashCache[path] = postContentFingerprint(content);
+      }
+      if (cachedId && frontmatterId !== cachedId) {
+        await this.setPluginFrontmatterKey(file, "wp-id", cachedId);
+      }
+      if (firstMigration || baselineMigration || !syncMarker) {
+        await this.setPluginFrontmatterKey(file, "wp-sync", "synced");
+      }
+      updated++;
+    }
+    if (baselineMigration) {
+      this.settings.wpSyncMigrationVersion = 3;
+    }
+    if (updated > 0) {
+      await this.saveSettings();
+      new import_obsidian.Notice(`WP Publisher migrated ${updated} published note${updated === 1 ? "" : "s"} to wp-sync tracking.`);
+    } else if (baselineMigration) {
+      await this.saveSettings();
+    }
+  }
+  async resolveWpId(file, fm) {
+    const path = (0, import_obsidian.normalizePath)(file.path);
+    const cached = (this.settings.wpIdCache[path] || "").trim();
+    const fmId = (fm["wp-id"] || "").trim();
+    const syncMarker = (fm["wp-sync"] || "").trim();
+    if (cached) {
+      if (!fmId && !syncMarker) return null;
+      if (fmId !== cached) {
+        await this.setPluginFrontmatterKey(file, "wp-id", cached);
+      }
+      return cached;
+    }
+    if (!fmId) return null;
+    this.settings.wpIdCache[path] = fmId;
+    await this.saveSettings();
+    await this.setPluginFrontmatterKey(file, "wp-id", fmId);
+    return fmId;
+  }
+  async storeWpId(file, wpId) {
+    const path = (0, import_obsidian.normalizePath)(file.path);
+    this.settings.wpIdCache[path] = wpId;
+    await this.saveSettings();
+    await this.setPluginFrontmatterKey(file, "wp-id", wpId);
+  }
+  async storeSyncedContentHash(file, content) {
+    const path = (0, import_obsidian.normalizePath)(file.path);
+    this.settings.wpContentHashCache[path] = postContentFingerprint(content);
+    await this.saveSettings();
+  }
+  async forgetWpId(file) {
+    const path = (0, import_obsidian.normalizePath)(file.path);
+    if (this.settings.wpIdCache[path]) {
+      delete this.settings.wpIdCache[path];
+      await this.saveSettings();
+    }
+    if (this.settings.wpContentHashCache[path]) {
+      delete this.settings.wpContentHashCache[path];
+      await this.saveSettings();
+    }
+    await deleteFrontmatterKey(this.app, file, "wp-id");
+    await deleteFrontmatterKey(this.app, file, "wp-sync");
+  }
+  getNextSitePostPath(folder) {
+    const normalizedFolder = (0, import_obsidian.normalizePath)(folder);
+    const prefix = normalizedFolder && normalizedFolder !== "/" ? `${normalizedFolder}/` : "";
+    let index = 1;
+    while (true) {
+      const baseName = `Site Post ${index}`;
+      const path = (0, import_obsidian.normalizePath)(`${prefix}${baseName}.md`);
+      if (!this.app.vault.getAbstractFileByPath(path)) return path;
+      index++;
+    }
+  }
+  async ensureFolderPath(folderPath) {
+    const normalized = (0, import_obsidian.normalizePath)(folderPath);
+    if (!normalized || normalized === "/") return;
+    const parts = normalized.split("/").filter(Boolean);
+    let current = "";
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      const existing = this.app.vault.getAbstractFileByPath(current);
+      if (existing instanceof import_obsidian.TFolder) continue;
+      if (existing) throw new Error(`Cannot create folder "${current}" because a file already exists there.`);
+      await this.app.vault.createFolder(current);
+    }
+  }
   // ── Hotkeys registered from stored combos ──
+  async updateCategoryCacheNote() {
+    const names = Array.from(new Map(categoryNamesFromSettings(this.settings).map((c) => [c.toLowerCase(), c])).values()).sort((a, b) => a.localeCompare(b));
+    const templatePath = (this.settings.defaultTemplatePath || "").trim();
+    const templateFolder = templatePath ? templatePath.split("/").slice(0, -1).join("/") : "";
+    const cacheFolder = templateFolder || (this.settings.publishFolder || "").trim() || "";
+    const cachePath = (0, import_obsidian.normalizePath)(`${cacheFolder ? `${cacheFolder}/` : ""}WP Publisher Category Cache.md`);
+    await this.ensureFolderPath(cachePath.split("/").slice(0, -1).join("/"));
+    const yamlList = names.length ? names.map((name) => `  - "${name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join("\n") : "[]";
+    const categoryBlock = names.length ? `category:
+${yamlList}
+categories:
+${yamlList}` : "category: []\ncategories: []";
+    const content = `---
+${categoryBlock}
+wp-publisher-internal: category-cache
+---
+# WP Publisher Category Cache
+
+This note is maintained by WP Publisher so Obsidian's native property dropdown can suggest known WordPress categories.
+
+Edit categories in Settings -> WP Publisher -> Categories. You can ignore this note.
+`;
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const path = (0, import_obsidian.normalizePath)(file.path);
+      if (path === cachePath) continue;
+      const current = await this.app.vault.read(file);
+      if (current.includes("wp-publisher-internal: category-cache")) {
+        await this.app.vault.delete(file);
+      }
+    }
+    const existing = this.app.vault.getAbstractFileByPath(cachePath);
+    if (existing instanceof import_obsidian.TFile) {
+      const current = await this.app.vault.read(existing);
+      if (current !== content) await this.app.vault.modify(existing, content);
+    } else if (!existing) {
+      await this.app.vault.create(cachePath, content);
+    }
+  }
   registerSavedHotkeys() {
+    for (const cleanup of this.hotkeyCleanups) cleanup();
+    this.hotkeyCleanups = [];
     const tryHotkey = (hk, action) => {
       if (!hk) return;
-      const modMap = {
-        Ctrl: "Mod",
-        Alt: "Alt",
-        Shift: "Shift",
-        Meta: "Meta"
-      };
       const handler = (e) => {
+        if (this.isRecordingHotkey) return;
         const pressed = eventToHotkey(e);
         if (!pressed) return;
         if (pressed.key === hk.key && pressed.modifiers.length === hk.modifiers.length && hk.modifiers.every((m) => pressed.modifiers.includes(m))) {
@@ -524,7 +939,8 @@ var WPPublisherPlugin = class extends import_obsidian.Plugin {
           action();
         }
       };
-      this.registerDomEvent(document, "keydown", handler);
+      document.addEventListener("keydown", handler, true);
+      this.hotkeyCleanups.push(() => document.removeEventListener("keydown", handler, true));
     };
     tryHotkey(this.settings.hotkeyPublish, () => {
       const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
@@ -569,6 +985,7 @@ var WPPublisherPlugin = class extends import_obsidian.Plugin {
 Change the folder in Settings \u2192 WP Publisher, or move the note.`, 1e4);
       return;
     }
+    await flushPendingObsidianPropertyEdit();
     const content = await this.app.vault.read(file);
     const fm = parseFrontmatter(content);
     let html = mdToHtml(stripFrontmatter(content));
@@ -583,26 +1000,42 @@ Change the folder in Settings \u2192 WP Publisher, or move the note.`, 1e4);
       status: desiredStatus,
       excerpt: fm["excerpt"] || ""
     };
+    const commentStatus = getCommentStatus(fm);
+    if (commentStatus) payload["comment_status"] = commentStatus;
     const previousStatus = (fm["status"] || "").trim().toLowerCase();
     try {
+      const unknownCategories = unknownCategoryNames(this.settings, categoryNamesFromFrontmatter(fm));
+      if (unknownCategories.length > 0) {
+        new import_obsidian.Notice(`Not in Known categories; WordPress will create if missing: ${unknownCategories.join(", ")}`, 8e3);
+      }
       const categoryIds = await resolveCategories(this.settings, fm);
       if (categoryIds) payload["categories"] = categoryIds;
-      const existingId = fm["wp-id"] || await findExistingPostByTitle(this.settings, title);
+      const existingId = await this.resolveWpId(file, fm) || await findExistingPostByTitle(this.settings, title);
       let post;
       if (existingId) {
         post = await wpRequest(this.settings, "POST", `posts/${existingId}`, payload);
-        await setFrontmatterKey(this.app, file, "wp-id", String(post.id));
+        await this.storeWpId(file, String(post.id));
         const msg = desiredStatus === "draft" ? previousStatus === "publish" ? "Taken down to draft" : "Draft updated" : previousStatus === "draft" ? "Published from draft" : "Post updated";
         new import_obsidian.Notice(`\u2705 ${msg}: "${title}"`);
       } else {
         post = await wpRequest(this.settings, "POST", "posts", payload);
-        await setFrontmatterKey(this.app, file, "wp-id", String(post.id));
+        await this.storeWpId(file, String(post.id));
         new import_obsidian.Notice(desiredStatus === "publish" ? `\u2705 Published: "${title}"` : `\u2705 Saved as new draft: "${title}"`);
       }
-      await setFrontmatterKey(this.app, file, "status", post.status);
+      if (unknownCategories.length > 0) {
+        try {
+          await this.addKnownCategories(unknownCategories);
+        } catch (categoryUpdateError) {
+          console.warn("WP Publisher could not update Known categories after publish", categoryUpdateError);
+          new import_obsidian.Notice("Post succeeded, but WP Publisher could not refresh Known categories. Reload or use Load from WordPress.", 1e4);
+        }
+      }
+      await this.storeSyncedContentHash(file, content);
+      await this.setPluginFrontmatterKey(file, "status", post.status);
+      await this.setPluginFrontmatterKey(file, "wp-sync", "synced");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      await setFrontmatterKey(this.app, file, "status", "error");
+      await this.setPluginFrontmatterKey(file, "status", "error");
       new import_obsidian.Notice(`\u26D4 Publish failed: ${msg}`, 1e4);
     }
   }
@@ -615,13 +1048,14 @@ Change the folder in Settings \u2192 WP Publisher, or move the note.`, 1e4);
     }
     const content = await this.app.vault.read(file);
     const fm = parseFrontmatter(content);
-    if (!fm["wp-id"]) {
+    const wpId = await this.resolveWpId(file, fm);
+    if (!wpId) {
       new import_obsidian.Notice("\u26D4 This note hasn't been published yet (no wp-id).");
       return;
     }
     try {
-      await wpRequest(this.settings, "POST", `posts/${fm["wp-id"]}`, { status: "draft" });
-      await setFrontmatterKey(this.app, file, "status", "draft");
+      await wpRequest(this.settings, "POST", `posts/${wpId}`, { status: "draft" });
+      await this.setPluginFrontmatterKey(file, "status", "draft");
       new import_obsidian.Notice(`\u2705 Reverted to draft: "${fm["title"] || file.basename}"`);
     } catch (e) {
       new import_obsidian.Notice(`\u26D4 Revert failed: ${e instanceof Error ? e.message : String(e)}`, 1e4);
@@ -631,14 +1065,14 @@ Change the folder in Settings \u2192 WP Publisher, or move the note.`, 1e4);
   async syncStatus(file, wpId) {
     try {
       const post = await wpRequest(this.settings, "GET", `posts/${wpId}`);
-      await setFrontmatterKey(this.app, file, "status", post.status);
+      await this.setPluginFrontmatterKey(file, "status", post.status);
     } catch (e) {
     }
   }
   // ── Template helpers ──
   async getTemplateContent() {
     const templatePath = this.settings.defaultTemplatePath.trim();
-    if (!templatePath) return DEFAULT_WP_POST_TEMPLATE;
+    if (!templatePath) return buildDefaultTemplate(this.settings);
     const templateFile = this.app.vault.getAbstractFileByPath((0, import_obsidian.normalizePath)(templatePath));
     if (!(templateFile instanceof import_obsidian.TFile)) {
       throw new Error(`Template note not found: "${templatePath}". Check the path in Settings \u2192 WP Publisher.`);
@@ -654,12 +1088,13 @@ Change the folder in Settings \u2192 WP Publisher, or move the note.`, 1e4);
       new import_obsidian.Notice(`\u26D4 ${e instanceof Error ? e.message : String(e)}`, 1e4);
       return;
     }
+    const folder = this.settings.publishFolder.trim();
+    const suggestedName = this.getNextSitePostPath(folder).split("/").pop()?.replace(/\.md$/i, "") || "Site Post";
     new NewNoteModal(this.app, async (noteName) => {
       if (!noteName.trim()) {
         new import_obsidian.Notice("Note name cannot be empty.");
         return;
       }
-      const folder = this.settings.publishFolder.trim();
       const fileName = noteName.endsWith(".md") ? noteName : `${noteName}.md`;
       const newPath = (0, import_obsidian.normalizePath)(folder && folder !== "/" ? `${folder}/${fileName}` : fileName);
       try {
@@ -669,7 +1104,7 @@ Change the folder in Settings \u2192 WP Publisher, or move the note.`, 1e4);
       } catch (e) {
         new import_obsidian.Notice(`\u26D4 Could not create note: ${e instanceof Error ? e.message : String(e)}`, 8e3);
       }
-    }).open();
+    }, suggestedName).open();
   }
   async applyTemplateToCurrentNote(file) {
     try {
@@ -695,11 +1130,20 @@ ${existing}`.trimEnd() + "\n");
       await wait(250);
       const existing = await this.app.vault.read(file);
       if (existing.trim().length > 0) return;
+      let targetFile = file;
+      if (/^Untitled(?: \d+)?$/i.test(file.basename)) {
+        const newPath = this.getNextSitePostPath(folder);
+        if (newPath !== file.path) {
+          await this.app.fileManager.renameFile(file, newPath);
+          const moved = this.app.vault.getAbstractFileByPath(newPath);
+          if (moved instanceof import_obsidian.TFile) targetFile = moved;
+        }
+      }
       const templateContent = await this.getTemplateContent();
-      await this.app.vault.modify(file, templateContent.trimEnd() + "\n");
-      new import_obsidian.Notice(`\u2705 WP template applied to new post note: "${file.basename}".`);
+      await this.app.vault.modify(targetFile, templateContent.trimEnd() + "\n");
+      new import_obsidian.Notice(`WP template applied to new post note: "${targetFile.basename}".`);
     } catch (e) {
-      new import_obsidian.Notice(`\u26D4 Could not auto-apply WP template: ${e instanceof Error ? e.message : String(e)}`, 1e4);
+      new import_obsidian.Notice(`Could not auto-apply WP template: ${e instanceof Error ? e.message : String(e)}`, 1e4);
     }
   }
 };
@@ -708,9 +1152,15 @@ var WPPublisherSettingTab = class extends import_obsidian.PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  refreshCategoryList() {
+    if (this.categoryTextAreaEl && this.categoryTextAreaEl.value !== this.plugin.settings.wpCategories) {
+      this.categoryTextAreaEl.value = this.plugin.settings.wpCategories;
+    }
+  }
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    this.plugin.updateCategoryCacheNote().catch((e) => console.warn("WP Publisher category cache update failed", e));
     containerEl.createEl("h2", { text: `WordPress connection \u2014 Hermes ${HERMES_PLUGIN_VERSION}` });
     new import_obsidian.Setting(containerEl).setName("Site URL").setDesc("Full URL including https://, e.g. https://mysite.com").addText(
       (t) => t.setPlaceholder("https://mysite.com").setValue(this.plugin.settings.wpUrl).onChange(async (v) => {
@@ -825,12 +1275,6 @@ var WPPublisherSettingTab = class extends import_obsidian.PluginSettingTab {
         })
       );
     }
-    new import_obsidian.Setting(containerEl).setName("Sync status on save").setDesc("Silently update status: in frontmatter whenever you save a note that has a wp-id.").addToggle(
-      (t) => t.setValue(this.plugin.settings.syncOnSave).onChange(async (v) => {
-        this.plugin.settings.syncOnSave = v;
-        await this.plugin.saveSettings();
-      })
-    );
     containerEl.createEl("h2", { text: "Template" });
     const tplSetting = new import_obsidian.Setting(containerEl).setName("Default template note").setDesc("Path to a note used as the template for new posts. Leave blank to use the built-in Hermes template. The note filename is used as the WordPress title.").addText((t) => {
       t.setPlaceholder("Templates/WP Post.md").setValue(this.plugin.settings.defaultTemplatePath).onChange(async (v) => {
@@ -855,9 +1299,68 @@ var WPPublisherSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    new import_obsidian.Setting(containerEl).setName("Sync status on save").setDesc("Silently update status: in frontmatter whenever you save a note with a plugin-managed wp-id.").addToggle(
+      (t) => t.setValue(this.plugin.settings.syncOnSave).onChange(async (v) => {
+        this.plugin.settings.syncOnSave = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    containerEl.createEl("h2", { text: "Categories" });
+    containerEl.createEl("p", {
+      text: "Add known WordPress categories here. Put each category on its own line, or separate categories with commas. If a category in note frontmatter does not exist in WordPress yet, WP Publisher will create it automatically when publishing."
+    }).style.cssText = "font-size:13px;color:var(--text-muted);margin-bottom:8px;";
+    const categorySetting = new import_obsidian.Setting(containerEl).setName("Known categories").setDesc("Used for category suggestions while typing category: or categories: in note frontmatter.");
+    categorySetting.addTextArea((t) => {
+      t.setPlaceholder("Blog\nNews\nProjects").setValue(this.plugin.settings.wpCategories).onChange(async (v) => {
+        this.plugin.settings.wpCategories = v;
+        await this.plugin.saveSettings();
+        await this.plugin.updateCategoryCacheNote();
+        this.refreshCategoryList();
+      });
+      t.inputEl.rows = 6;
+      t.inputEl.style.width = "100%";
+      t.inputEl.style.minWidth = "360px";
+      t.inputEl.style.resize = "vertical";
+      this.categoryTextAreaEl = t.inputEl;
+    });
+    categorySetting.addButton((btn) => {
+      btn.setButtonText("?").setTooltip("Category list format").onClick(() => {
+        new import_obsidian.Notice("Use one category per line or separate them with commas. If a note is published or drafted and the category is not in the list, the category is created automatically in WordPress.", 12e3);
+      });
+    });
+    categorySetting.addButton((btn) => {
+      btn.setButtonText("Refresh from WordPress").setTooltip("Replace Known categories with the current WordPress category list.").onClick(async () => {
+        const validErr = this.plugin.validateSettings();
+        if (validErr) {
+          new import_obsidian.Notice(`\u26D4 ${validErr}`, 8e3);
+          return;
+        }
+        try {
+          const loaded = await fetchWordPressCategoryNames(this.plugin.settings);
+          const merged = mergeCategoryNames([], loaded);
+          this.plugin.settings.wpCategories = merged.join("\n");
+          await this.plugin.saveSettings();
+          await this.plugin.updateCategoryCacheNote();
+          this.refreshCategoryList();
+          new import_obsidian.Notice(`\u2705 Loaded ${loaded.length} categories from WordPress.`);
+          this.display();
+        } catch (e) {
+          new import_obsidian.Notice(`\u26D4 Category load failed: ${e instanceof Error ? e.message : String(e)}`, 1e4);
+        }
+      });
+    });
+    categorySetting.settingEl.style.alignItems = "stretch";
+    categorySetting.infoEl.style.alignSelf = "flex-start";
+    categorySetting.controlEl.style.flexDirection = "column";
+    categorySetting.controlEl.style.alignItems = "stretch";
+    categorySetting.controlEl.style.gap = "8px";
+    const categoryButtonRow = categorySetting.controlEl.createDiv();
+    categoryButtonRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+    const categoryButtons = Array.from(categorySetting.controlEl.querySelectorAll("button"));
+    for (const button of categoryButtons) categoryButtonRow.appendChild(button);
     containerEl.createEl("h2", { text: "Hotkeys" });
     containerEl.createEl("p", {
-      text: "Click a record button, then press your desired key combination (must include Ctrl, Alt, Shift, or Meta). Press Escape to cancel recording."
+      text: "Click Record, press your desired key combination, then click Stop recording to save it. Press Escape to cancel recording."
     }).style.cssText = "font-size:13px;color:var(--text-muted);margin-bottom:12px;";
     this.addHotkeySetting(containerEl, "Publish hotkey", "hotkeyPublish");
     this.addHotkeySetting(containerEl, "Draft hotkey", "hotkeyDraft");
@@ -871,8 +1374,10 @@ var WPPublisherSettingTab = class extends import_obsidian.PluginSettingTab {
 			<code>title:</code> \u2014 optional override; by default the post title comes from the note filename<br>
 			<code>category:</code> \u2014 WordPress category (auto-created if new; blank uses WordPress Uncategorized)<br>
 			<code>excerpt:</code> \u2014 post summary / meta description<br>
+			<code>comments:</code> \u2014 <code>on</code> or <code>off</code>; sends WordPress comment_status open/closed for anti-bot control<br>
 			<code>status:</code> \u2014 updated automatically by the plugin<br>
-			<code>wp-id:</code> \u2014 written automatically after first publish<br>
+			<code>wp-id:</code> \u2014 visible publish marker, managed automatically by WP Publisher<br>
+			<code>wp-sync:</code> \u2014 <code>synced</code> after publish/draft; <code>out-of-sync</code> after local edits<br>
 		`;
   }
   // Show a green ✅ or red ⛔ next to the template path
@@ -896,50 +1401,77 @@ var WPPublisherSettingTab = class extends import_obsidian.PluginSettingTab {
     display.style.cssText = "min-width:160px;display:inline-block;font-size:13px;padding:4px 8px;background:var(--background-modifier-form-field);border-radius:4px;border:1px solid var(--background-modifier-border);";
     display.textContent = hotkeyLabel(current);
     let recording = false;
-    let keydownHandler = null;
-    const stopRecording = () => {
+    let pendingHotkey = null;
+    let keyHandler = null;
+    const detachRecorder = () => {
       recording = false;
-      recordBtn.textContent = "Record";
+      this.plugin.isRecordingHotkey = false;
       recordBtn.classList.remove("mod-warning");
-      if (keydownHandler) {
-        document.removeEventListener("keydown", keydownHandler, true);
-        keydownHandler = null;
+      if (keyHandler) {
+        document.removeEventListener("keydown", keyHandler, true);
+        document.removeEventListener("keyup", keyHandler, true);
+        window.removeEventListener("keydown", keyHandler, true);
+        window.removeEventListener("keyup", keyHandler, true);
+        keyHandler = null;
       }
+    };
+    const savePendingHotkey = async () => {
+      detachRecorder();
+      recordBtn.textContent = "Record";
+      if (!pendingHotkey) return;
+      this.plugin.settings[settingKey] = pendingHotkey;
+      await this.plugin.saveSettings();
+      this.plugin.registerSavedHotkeys();
+      display.textContent = hotkeyLabel(pendingHotkey);
+      new import_obsidian.Notice(`\u2705 ${label} set to ${hotkeyLabel(pendingHotkey)}`);
+      pendingHotkey = null;
     };
     const recordBtn = row.controlEl.createEl("button", { text: "Record" });
     recordBtn.style.marginLeft = "8px";
-    recordBtn.onclick = () => {
+    recordBtn.onclick = async () => {
       if (recording) {
-        stopRecording();
+        await savePendingHotkey();
         return;
       }
       recording = true;
-      recordBtn.textContent = "Press keys\u2026 (Esc to cancel)";
+      pendingHotkey = null;
+      this.plugin.isRecordingHotkey = true;
+      recordBtn.textContent = "Stop recording";
       recordBtn.classList.add("mod-warning");
-      keydownHandler = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
+      display.textContent = "Press keybind\u2026";
+      keyHandler = (e) => {
         if (e.key === "Escape") {
-          stopRecording();
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          pendingHotkey = null;
+          display.textContent = hotkeyLabel(this.plugin.settings[settingKey]);
+          detachRecorder();
+          recordBtn.textContent = "Record";
           return;
         }
         const hk = eventToHotkey(e);
         if (!hk) return;
-        stopRecording();
-        this.plugin.settings[settingKey] = hk;
-        this.plugin.saveSettings();
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        pendingHotkey = hk;
         display.textContent = hotkeyLabel(hk);
-        new import_obsidian.Notice(`\u2705 ${label} set to ${hotkeyLabel(hk)}
-Restart Obsidian to remove any old binding.`);
       };
-      document.addEventListener("keydown", keydownHandler, true);
+      document.addEventListener("keydown", keyHandler, true);
+      document.addEventListener("keyup", keyHandler, true);
+      window.addEventListener("keydown", keyHandler, true);
+      window.addEventListener("keyup", keyHandler, true);
     };
     const clearBtn = row.controlEl.createEl("button", { text: "Clear" });
     clearBtn.style.marginLeft = "6px";
     clearBtn.onclick = async () => {
-      stopRecording();
+      detachRecorder();
+      recordBtn.textContent = "Record";
+      pendingHotkey = null;
       this.plugin.settings[settingKey] = null;
       await this.plugin.saveSettings();
+      this.plugin.registerSavedHotkeys();
       display.textContent = hotkeyLabel(null);
     };
   }

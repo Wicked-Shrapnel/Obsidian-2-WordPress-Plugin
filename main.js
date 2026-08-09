@@ -729,12 +729,12 @@ var WPPublisherPlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "wp-new-from-template",
-      name: "New note from WP-Publisher template",
+      name: "New note from template",
       callback: () => this.newNoteFromTemplate()
     });
     this.addCommand({
       id: "wp-apply-template",
-      name: "Apply WP-Publisher template to current note",
+      name: "Apply template to current note",
       editorCallback: (_e, view) => {
         if (view.file) this.applyTemplateToCurrentNote(view.file);
       }

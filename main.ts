@@ -34,9 +34,15 @@ interface WPPublisherSettings {
 	wpUrl: string;
 	wpUsername: string;
 	wpPassword: string;
+	showSidebarButton: boolean;
 	defaultTemplatePath: string;
-	publishFolder: string;    // "" = any folder; otherwise restrict to this path
+	publishFolder: string;    // required folder path for publishable notes
 	wpCategories: string;
+	autoCreateCategories: boolean;
+	wpCategoriesLastRefreshedAt: number;
+	wpCategoriesLastSource: "manual" | "wordpress";
+	wpCategoriesLastWordPressSnapshot: string;
+	wpCategoriesLastMessage: string;
 	wpIdCache: Record<string, string>;
 	wpContentHashCache: Record<string, string>;
 	wpSyncMigrationVersion: number;
@@ -50,9 +56,15 @@ const DEFAULT_SETTINGS: WPPublisherSettings = {
 	wpUrl: "",
 	wpUsername: "",
 	wpPassword: "",
+	showSidebarButton: true,
 	defaultTemplatePath: "",
 	publishFolder: "",
 	wpCategories: "Blog\nNews\nProjects\nTo Do List\nUncategorized\nWrite Ups",
+	autoCreateCategories: true,
+	wpCategoriesLastRefreshedAt: 0,
+	wpCategoriesLastSource: "manual",
+	wpCategoriesLastWordPressSnapshot: "",
+	wpCategoriesLastMessage: "",
 	wpIdCache: {},
 	wpContentHashCache: {},
 	wpSyncMigrationVersion: 0,
@@ -62,7 +74,7 @@ const DEFAULT_SETTINGS: WPPublisherSettings = {
 	hotkeyDraft: null,
 };
 
-const HERMES_PLUGIN_VERSION = "1.0.3-hermes.1";
+const WP_PUBLISHER_VERSION = "1.0.4";
 const DEFAULT_WP_POST_TEMPLATE = `---
 category: 
 excerpt: 
@@ -97,6 +109,26 @@ function mergeCategoryNames(existing: string[], incoming: string[]): string[] {
 			.filter(Boolean)
 			.map(c => [c.toLowerCase(), c])
 	).values()).sort((a, b) => a.localeCompare(b));
+}
+
+function normalizedCategorySnapshot(value: string | string[]): string {
+	const categories = Array.isArray(value) ? value : value.split(/[\n,]/);
+	return mergeCategoryNames([], categories).join("\n");
+}
+
+function formatRelativeRefreshTime(timestamp: number): string {
+	if (!timestamp) return "never";
+	const diffMs = Math.max(0, Date.now() - timestamp);
+	const diffMinutes = Math.floor(diffMs / 60000);
+	if (diffMinutes < 1) return "just now";
+	if (diffMinutes === 1) return "1 minute ago";
+	if (diffMinutes < 60) return `${diffMinutes} minutes ago`;
+	const diffHours = Math.floor(diffMinutes / 60);
+	if (diffHours === 1) return "1 hour ago";
+	if (diffHours < 24) return `${diffHours} hours ago`;
+	const diffDays = Math.floor(diffHours / 24);
+	if (diffDays === 1) return "1 day ago";
+	return `${diffDays} days ago`;
 }
 
 function yamlQuote(value: string): string {
@@ -395,8 +427,42 @@ async function deleteFrontmatterKey(app: App, file: TFile, key: string) {
 // ─────────────────────────────────────────────
 
 interface WPPost { id: number; status: string; link: string; }
+interface WPCurrentUser { id: number; name?: string; slug?: string; username?: string; }
 
 function basicAuth(u: string, p: string) { return "Basic " + btoa(`${u}:${p}`); }
+
+function normalizeWpIdentity(value: string): string {
+	return value.trim().toLowerCase();
+}
+
+function wpUserMatchesConfiguredUsername(user: WPCurrentUser, configuredUsername: string): boolean {
+	const expected = normalizeWpIdentity(configuredUsername);
+	return [user.username, user.slug, user.name]
+		.filter(Boolean)
+		.some(value => normalizeWpIdentity(String(value)) === expected);
+}
+
+async function testWordPressConnection(s: WPPublisherSettings): Promise<WPCurrentUser> {
+	const base = s.wpUrl.replace(/\/$/, "");
+	const resp = await requestUrl({
+		url: `${base}/wp-json/wp/v2/users/me?context=edit`,
+		method: "GET",
+		headers: { Authorization: basicAuth(s.wpUsername, s.wpPassword) },
+		throw: false,
+	});
+	if (resp.status >= 400) {
+		let msg = `HTTP ${resp.status}`;
+		try { const e = resp.json; if (e?.message) msg = e.message; else if (e?.code) msg = e.code; } catch { /**/ }
+		throw new Error(msg);
+	}
+	const user = resp.json as WPCurrentUser;
+	if (!user?.id) throw new Error("WordPress did not return an authenticated user.");
+	if (!wpUserMatchesConfiguredUsername(user, s.wpUsername)) {
+		const actual = user.username || user.slug || user.name || `user #${user.id}`;
+		throw new Error(`Authenticated as "${actual}", not "${s.wpUsername}". Check the WordPress username.`);
+	}
+	return user;
+}
 
 async function wpRequest(
 	s: WPPublisherSettings,
@@ -422,7 +488,7 @@ async function wpRequest(
 	return resp.json as WPPost;
 }
 
-async function resolveCategory(s: WPPublisherSettings, name: string): Promise<number> {
+async function findCategoryId(s: WPPublisherSettings, name: string): Promise<number | null> {
 	const base = s.wpUrl.replace(/\/$/, "");
 	const sr = await requestUrl({
 		url: `${base}/wp-json/wp/v2/categories?search=${encodeURIComponent(name)}&per_page=10`,
@@ -435,6 +501,13 @@ async function resolveCategory(s: WPPublisherSettings, name: string): Promise<nu
 		const match = cats.find(c => c.name.toLowerCase() === name.toLowerCase());
 		if (match) return match.id;
 	}
+	return null;
+}
+
+async function resolveCategory(s: WPPublisherSettings, name: string): Promise<number> {
+	const base = s.wpUrl.replace(/\/$/, "");
+	const existingId = await findCategoryId(s, name);
+	if (existingId) return existingId;
 	const cr = await requestUrl({
 		url: `${base}/wp-json/wp/v2/categories`,
 		method: "POST",
@@ -452,12 +525,20 @@ function categoryNamesFromFrontmatter(fm: Record<string, string>): string[] {
 	return raw.split(",").map(c => c.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
 }
 
-async function resolveCategories(s: WPPublisherSettings, fm: Record<string, string>): Promise<number[] | undefined> {
+async function resolveCategories(s: WPPublisherSettings, fm: Record<string, string>, createMissingCategories = true): Promise<number[] | undefined> {
 	const names = categoryNamesFromFrontmatter(fm);
 	// Same behavior as the Python version/readme: a blank category lets WordPress use Uncategorized.
 	if (names.length === 0) return undefined;
 	const ids: number[] = [];
-	for (const name of names) ids.push(await resolveCategory(s, canonicalCategoryName(s, name)));
+	for (const name of names) {
+		const canonical = canonicalCategoryName(s, name);
+		if (createMissingCategories) {
+			ids.push(await resolveCategory(s, canonical));
+		} else {
+			const existingId = await findCategoryId(s, canonical);
+			if (existingId) ids.push(existingId);
+		}
+	}
 	return ids;
 }
 
@@ -721,16 +802,24 @@ export default class WPPublisherPlugin extends Plugin {
 	private pendingCategoryCreateTimers: Record<string, number> = {};
 	settingsTab?: WPPublisherSettingTab;
 	isRecordingHotkey = false;
+	ribbonIconEl: HTMLElement | null = null;
+
+	updateRibbonIcon() {
+		this.ribbonIconEl?.remove();
+		this.ribbonIconEl = null;
+		if (!this.settings.showSidebarButton) return;
+		this.ribbonIconEl = this.addRibbonIcon("upload-cloud", "Publish to WordPress", () => {
+			const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (view?.file) this.publishNote(view.file, "publish");
+			else new Notice("Open a note first.");
+		});
+	}
 
 	async onload() {
 		await this.loadSettings();
 
 		// Ribbon icon
-		this.addRibbonIcon("upload-cloud", "Publish to WordPress", () => {
-			const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-			if (view?.file) this.publishNote(view.file, "publish");
-			else new Notice("Open a note first.");
-		});
+		this.updateRibbonIcon();
 
 		// Command: publish
 		this.addCommand({
@@ -762,14 +851,14 @@ export default class WPPublisherPlugin extends Plugin {
 		// Command: new from template
 		this.addCommand({
 			id: "wp-new-from-template",
-			name: "New note from WP Publisher template",
+			name: "New note from WP-Publisher template",
 			callback: () => this.newNoteFromTemplate(),
 		});
 
 		// Command: apply template to current note
 		this.addCommand({
 			id: "wp-apply-template",
-			name: "Apply WP Publisher template to current note",
+			name: "Apply WP-Publisher template to current note",
 			editorCallback: (_e: Editor, view: MarkdownView) => {
 				if (view.file) this.applyTemplateToCurrentNote(view.file);
 			},
@@ -787,17 +876,17 @@ export default class WPPublisherPlugin extends Plugin {
 			editorCallback: async (_e: Editor, view: MarkdownView) => {
 				if (!view.file) return;
 				await this.forgetWpId(view.file);
-				new Notice("WP Publisher link cleared for this note.");
+				new Notice("WP-Publisher link cleared for this note.");
 			},
 		});
 
 		// Register custom hotkeys from settings
 		this.registerSavedHotkeys();
 
-		// Category suggestions from Settings → WP Publisher → Categories.
+		// Category suggestions from Settings → WP-Publisher → Categories.
 		this.registerEditorSuggest(new CategoryEditorSuggest(this.app, this));
-		this.updateCategoryCacheNote().catch(e => console.warn("WP Publisher category cache update failed", e));
-		await this.migrateWpSyncField().catch(e => console.warn("WP Publisher wp-sync migration failed", e));
+		this.updateCategoryCacheNote().catch(e => console.warn("WP-Publisher category cache update failed", e));
+		await this.migrateWpSyncField().catch(e => console.warn("WP-Publisher wp-sync migration failed", e));
 
 		// Auto-sync on save
 		this.registerEvent(
@@ -831,7 +920,7 @@ export default class WPPublisherPlugin extends Plugin {
 		);
 
 		// Auto-apply template to ordinary new blank notes created in the publish folder.
-		// The explicit "New note from WP Publisher template" command already creates
+		// The explicit "New note from WP-Publisher template" command already creates
 		// notes with content, so this handler skips non-empty files to avoid doubles.
 		this.registerEvent(
 			this.app.vault.on("create", async (file: TAbstractFile) => {
@@ -860,6 +949,10 @@ export default class WPPublisherPlugin extends Plugin {
 		const merged = mergeCategoryNames(categoryNamesFromSettings(this.settings), names);
 		if (merged.join("\n") === categoryNamesFromSettings(this.settings).join("\n")) return;
 		this.settings.wpCategories = merged.join("\n");
+		this.settings.wpCategoriesLastRefreshedAt = Date.now();
+		this.settings.wpCategoriesLastSource = "wordpress";
+		this.settings.wpCategoriesLastWordPressSnapshot = normalizedCategorySnapshot(merged);
+		this.settings.wpCategoriesLastMessage = `Updated from WordPress: ${names.join(", ")}`;
 		await this.saveSettings();
 		await this.updateCategoryCacheNote();
 		this.settingsTab?.refreshCategoryList();
@@ -874,7 +967,10 @@ export default class WPPublisherPlugin extends Plugin {
 		if ((this.pendingCategoryNoticeUntil[path] || 0) > now) return;
 		this.pendingCategoryNoticeUntil[path] = now + 30000;
 		const statusName = (fm["status"] || "unknown").trim() || "unknown";
-		new Notice(`This post is currently ${statusName}, but this category has not been created yet: ${unknownCategories.join(", ")}. Publish or save as draft to create/update it in WordPress.`, 12000);
+		const message = this.settings.autoCreateCategories
+			? `This post is currently ${statusName}, but this category has not been created yet: ${unknownCategories.join(", ")}. Publish or save as draft to create/update it in WordPress.`
+			: `This post is currently ${statusName}, and this category is not in the list: ${unknownCategories.join(", ")}. Automatic category creation is off.`;
+		new Notice(message, 12000);
 	}
 
 	schedulePendingCategoryCreation(file: TFile) {
@@ -885,13 +981,14 @@ export default class WPPublisherPlugin extends Plugin {
 		this.pendingCategoryCreateTimers[path] = window.setTimeout(() => {
 			delete this.pendingCategoryCreateTimers[path];
 			this.createMissingCategoriesForFile(file).catch(e => {
-				console.warn("WP Publisher category auto-create failed", e);
+				console.warn("WP-Publisher category auto-create failed", e);
 				new Notice(`Category auto-create failed: ${e instanceof Error ? e.message : String(e)}`, 10000);
 			});
 		}, 1500);
 	}
 
 	async createMissingCategoriesForFile(file: TFile) {
+		if (!this.settings.autoCreateCategories) return;
 		const validErr = this.validateSettings();
 		await flushPendingObsidianPropertyEdit();
 		const content = await this.app.vault.read(file);
@@ -951,7 +1048,7 @@ export default class WPPublisherPlugin extends Plugin {
 		}
 		if (updated > 0) {
 			await this.saveSettings();
-			new Notice(`WP Publisher migrated ${updated} published note${updated === 1 ? "" : "s"} to wp-sync tracking.`);
+			new Notice(`WP-Publisher migrated ${updated} published note${updated === 1 ? "" : "s"} to wp-sync tracking.`);
 		} else if (baselineMigration) {
 			await this.saveSettings();
 		}
@@ -1039,13 +1136,13 @@ export default class WPPublisherPlugin extends Plugin {
 			? templatePath.split("/").slice(0, -1).join("/")
 			: "";
 		const cacheFolder = templateFolder || (this.settings.publishFolder || "").trim() || "";
-		const cachePath = normalizePath(`${cacheFolder ? `${cacheFolder}/` : ""}WP Publisher Category Cache.md`);
+		const cachePath = normalizePath(`${cacheFolder ? `${cacheFolder}/` : ""}WP-Publisher Category Cache.md`);
 		await this.ensureFolderPath(cachePath.split("/").slice(0, -1).join("/"));
 		const yamlList = names.length
 			? names.map(name => `  - "${name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join("\n")
 			: "[]";
 		const categoryBlock = names.length ? `category:\n${yamlList}\ncategories:\n${yamlList}` : "category: []\ncategories: []";
-		const content = `---\n${categoryBlock}\nwp-publisher-internal: category-cache\n---\n# WP Publisher Category Cache\n\nThis note is maintained by WP Publisher so Obsidian's native property dropdown can suggest known WordPress categories.\n\nEdit categories in Settings -> WP Publisher -> Categories. You can ignore this note.\n`;
+		const content = `---\n${categoryBlock}\nwp-publisher-internal: category-cache\n---\n# WP-Publisher Category Cache\n\nThis note is maintained by WP-Publisher so Obsidian's native property dropdown can suggest known WordPress categories.\n\nEdit categories in Settings -> WP-Publisher -> Categories. You can ignore this note.\n`;
 		for (const file of this.app.vault.getMarkdownFiles()) {
 			const path = normalizePath(file.path);
 			if (path === cachePath) continue;
@@ -1068,7 +1165,7 @@ export default class WPPublisherPlugin extends Plugin {
 		this.hotkeyCleanups = [];
 
 		// Listen in the capture phase so Obsidian/browser-level shortcuts like
-		// Ctrl+Shift+P do not swallow the event before WP Publisher sees it.
+		// Ctrl+Shift+P do not swallow the event before WP-Publisher sees it.
 		const tryHotkey = (hk: HotkeyDef | null, action: () => void) => {
 			if (!hk) return;
 			const handler = (e: KeyboardEvent) => {
@@ -1101,7 +1198,7 @@ export default class WPPublisherPlugin extends Plugin {
 
 	// ── Validate settings ──
 	validateSettings(): string | null {
-		if (!this.settings.wpUrl) return "WordPress URL is not set. Go to Settings → WP Publisher.";
+		if (!this.settings.wpUrl) return "WordPress URL is not set. Go to Settings → WP-Publisher.";
 		if (!this.settings.wpUsername) return "WordPress username is not set.";
 		if (!this.settings.wpPassword) return "WordPress application password is not set.";
 		try { new URL(this.settings.wpUrl); } catch {
@@ -1111,9 +1208,15 @@ export default class WPPublisherPlugin extends Plugin {
 	}
 
 	// ── Folder check ──
+	publishFolderError(): string | null {
+		const folder = this.settings.publishFolder.trim();
+		if (!folder || folder === "/") return "Publish folder is not set. Go to Settings → WP-Publisher and choose a dedicated folder.";
+		return null;
+	}
+
 	fileIsAllowed(file: TFile): boolean {
 		const folder = this.settings.publishFolder.trim();
-		if (!folder || folder === "/") return true; // unrestricted
+		if (!folder || folder === "/") return false;
 		return file.path.startsWith(folder + "/") || file.parent?.path === folder;
 	}
 
@@ -1121,10 +1224,12 @@ export default class WPPublisherPlugin extends Plugin {
 	async publishNote(file: TFile, desiredStatus: "publish" | "draft") {
 		const err = this.validateSettings();
 		if (err) { new Notice(`⛔ ${err}`, 8000); return; }
+		const folderErr = this.publishFolderError();
+		if (folderErr) { new Notice(`⛔ ${folderErr}`, 10000); return; }
 
 		if (!this.fileIsAllowed(file)) {
 			const folder = this.settings.publishFolder;
-			new Notice(`⛔ This note is not in the publish folder:\n"${folder}"\n\nChange the folder in Settings → WP Publisher, or move the note.`, 10000);
+			new Notice(`⛔ This note is not in the publish folder:\n"${folder}"\n\nChange the folder in Settings → WP-Publisher, or move the note.`, 10000);
 			return;
 		}
 
@@ -1149,9 +1254,12 @@ export default class WPPublisherPlugin extends Plugin {
 		try {
 			const unknownCategories = unknownCategoryNames(this.settings, categoryNamesFromFrontmatter(fm));
 			if (unknownCategories.length > 0) {
-				new Notice(`Not in Known categories; WordPress will create if missing: ${unknownCategories.join(", ")}`, 8000);
+				const message = this.settings.autoCreateCategories
+					? `Not in Known categories; WordPress will create if missing: ${unknownCategories.join(", ")}`
+					: `Not in Known categories and automatic category creation is off: ${unknownCategories.join(", ")}`;
+				new Notice(message, 8000);
 			}
-			const categoryIds = await resolveCategories(this.settings, fm);
+			const categoryIds = await resolveCategories(this.settings, fm, this.settings.autoCreateCategories);
 			if (categoryIds) payload["categories"] = categoryIds;
 
 			const existingId = await this.resolveWpId(file, fm) || await findExistingPostByTitle(this.settings, title);
@@ -1168,12 +1276,12 @@ export default class WPPublisherPlugin extends Plugin {
 				await this.storeWpId(file, String(post.id));
 				new Notice(desiredStatus === "publish" ? `✅ Published: "${title}"` : `✅ Saved as new draft: "${title}"`);
 			}
-			if (unknownCategories.length > 0) {
+			if (unknownCategories.length > 0 && this.settings.autoCreateCategories) {
 				try {
 					await this.addKnownCategories(unknownCategories);
 				} catch (categoryUpdateError) {
-					console.warn("WP Publisher could not update Known categories after publish", categoryUpdateError);
-					new Notice("Post succeeded, but WP Publisher could not refresh Known categories. Reload or use Load from WordPress.", 10000);
+					console.warn("WP-Publisher could not update Known categories after publish", categoryUpdateError);
+					new Notice("Post succeeded, but WP-Publisher could not refresh Known categories. Reload or use Replace from WordPress.", 10000);
 				}
 			}
 			await this.storeSyncedContentHash(file, content);
@@ -1190,6 +1298,13 @@ export default class WPPublisherPlugin extends Plugin {
 	async revertToDraft(file: TFile) {
 		const err = this.validateSettings();
 		if (err) { new Notice(`⛔ ${err}`, 8000); return; }
+		const folderErr = this.publishFolderError();
+		if (folderErr) { new Notice(`⛔ ${folderErr}`, 10000); return; }
+		if (!this.fileIsAllowed(file)) {
+			const folder = this.settings.publishFolder;
+			new Notice(`⛔ This note is not in the publish folder:\n"${folder}"\n\nChange the folder in Settings → WP-Publisher, or move the note.`, 10000);
+			return;
+		}
 		const content = await this.app.vault.read(file);
 		const fm = parseFrontmatter(content);
 		const wpId = await this.resolveWpId(file, fm);
@@ -1217,13 +1332,16 @@ export default class WPPublisherPlugin extends Plugin {
 		if (!templatePath) return buildDefaultTemplate(this.settings);
 		const templateFile = this.app.vault.getAbstractFileByPath(normalizePath(templatePath));
 		if (!(templateFile instanceof TFile)) {
-			throw new Error(`Template note not found: "${templatePath}". Check the path in Settings → WP Publisher.`);
+			throw new Error(`Template note not found: "${templatePath}". Check the path in Settings → WP-Publisher.`);
 		}
 		return await this.app.vault.read(templateFile);
 	}
 
 	// ── New note from template ──
 	async newNoteFromTemplate() {
+		const folderErr = this.publishFolderError();
+		if (folderErr) { new Notice(`⛔ ${folderErr}`, 10000); return; }
+
 		let templateContent: string;
 		try {
 			templateContent = await this.getTemplateContent();
@@ -1238,9 +1356,8 @@ export default class WPPublisherPlugin extends Plugin {
 		new NewNoteModal(this.app, async (noteName: string) => {
 			if (!noteName.trim()) { new Notice("Note name cannot be empty."); return; }
 
-			// Place new note in the publish folder if one is set, otherwise vault root
 			const fileName = noteName.endsWith(".md") ? noteName : `${noteName}.md`;
-			const newPath = normalizePath(folder && folder !== "/" ? `${folder}/${fileName}` : fileName);
+			const newPath = normalizePath(`${folder}/${fileName}`);
 
 			try {
 				const newFile = await this.app.vault.create(newPath, templateContent);
@@ -1258,7 +1375,7 @@ export default class WPPublisherPlugin extends Plugin {
 			if (existing.trim().length > 0 && !confirm("This note already has content. Add the WP template to the top anyway?")) return;
 			const templateContent = await this.getTemplateContent();
 			await this.app.vault.modify(file, `${templateContent.trim()}\n\n${existing}`.trimEnd() + "\n");
-			new Notice(`✅ WP Publisher template applied to "${file.basename}".`);
+			new Notice(`✅ WP-Publisher template applied to "${file.basename}".`);
 		} catch (e: unknown) {
 			new Notice(`⛔ Could not apply template: ${e instanceof Error ? e.message : String(e)}`, 10000);
 		}
@@ -1309,6 +1426,7 @@ export default class WPPublisherPlugin extends Plugin {
 class WPPublisherSettingTab extends PluginSettingTab {
 	plugin: WPPublisherPlugin;
 	categoryTextAreaEl?: HTMLTextAreaElement;
+	categoryInlineStatusEl?: HTMLDivElement;
 
 	constructor(app: App, plugin: WPPublisherPlugin) {
 		super(app, plugin);
@@ -1319,15 +1437,32 @@ class WPPublisherSettingTab extends PluginSettingTab {
 		if (this.categoryTextAreaEl && this.categoryTextAreaEl.value !== this.plugin.settings.wpCategories) {
 			this.categoryTextAreaEl.value = this.plugin.settings.wpCategories;
 		}
+		this.refreshCategoryStatus();
+	}
+
+	refreshCategoryStatus() {
+		const categoryCount = categoryNamesFromSettings(this.plugin.settings).length;
+		const source = this.plugin.settings.wpCategoriesLastSource === "wordpress" ? "WordPress" : "Manual";
+		const currentSnapshot = normalizedCategorySnapshot(this.plugin.settings.wpCategories);
+		const lastSnapshot = this.plugin.settings.wpCategoriesLastWordPressSnapshot || "";
+		const status = this.plugin.settings.wpCategoriesLastSource === "wordpress" && currentSnapshot === lastSnapshot
+			? "in sync"
+			: "needs refresh";
+		if (this.categoryInlineStatusEl) {
+			this.categoryInlineStatusEl.empty();
+			const message = this.plugin.settings.wpCategoriesLastMessage || "No category updates yet";
+			this.categoryInlineStatusEl.createEl("div", { text: message }).style.cssText = "font-weight:600;color:var(--text-normal);";
+			this.categoryInlineStatusEl.createEl("div", { text: `Refresh state: ${status}` });
+		}
 	}
 
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		this.plugin.updateCategoryCacheNote().catch(e => console.warn("WP Publisher category cache update failed", e));
+		this.plugin.updateCategoryCacheNote().catch(e => console.warn("WP-Publisher category cache update failed", e));
 
 		// ── WordPress Connection ──────────────────────────────────
-		containerEl.createEl("h2", { text: `WordPress connection — Hermes ${HERMES_PLUGIN_VERSION}` });
+		containerEl.createEl("h2", { text: `WordPress connection — WP-Publisher ${WP_PUBLISHER_VERSION}` });
 
 		new Setting(containerEl)
 			.setName("Site URL")
@@ -1424,8 +1559,8 @@ class WPPublisherSettingTab extends PluginSettingTab {
 			const validErr = this.plugin.validateSettings();
 			if (validErr) { testResult.textContent = `⛔ ${validErr}`; return; }
 			try {
-				await wpRequest(this.plugin.settings, "GET", "posts?per_page=1");
-				testResult.textContent = "✅ Connected!";
+				await testWordPressConnection(this.plugin.settings);
+				testResult.textContent = "✅ Connected";
 			} catch (e: unknown) {
 				testResult.textContent = `⛔ ${e instanceof Error ? e.message : String(e)}`;
 			}
@@ -1437,9 +1572,9 @@ class WPPublisherSettingTab extends PluginSettingTab {
 		// Publish folder
 		const folderSetting = new Setting(containerEl)
 			.setName("Publish folder")
-			.setDesc("Only notes in this folder can be published. Leave empty to allow any note.")
+			.setDesc("Only notes in this folder can be published or drafted. Choose a dedicated folder for WordPress posts.")
 			.addText(t => {
-				t.setPlaceholder("(any folder)")
+				t.setPlaceholder("Posts")
 					.setValue(this.plugin.settings.publishFolder)
 					.onChange(async v => {
 						this.plugin.settings.publishFolder = v.trim();
@@ -1452,7 +1587,11 @@ class WPPublisherSettingTab extends PluginSettingTab {
 				.setButtonText("Browse…")
 				.onClick(() => {
 					new FolderSuggestModal(this.app, async (folder: TFolder) => {
-						const path = folder.path === "/" ? "" : folder.path;
+						if (folder.path === "/") {
+							new Notice("Choose a dedicated publish folder, not the vault root.", 8000);
+							return;
+						}
+						const path = folder.path;
 						this.plugin.settings.publishFolder = path;
 						await this.plugin.saveSettings();
 						this.display(); // re-render to show new value
@@ -1469,26 +1608,12 @@ class WPPublisherSettingTab extends PluginSettingTab {
 			badge.style.cssText = "font-size:12px;color:var(--text-muted);margin-top:4px;";
 		}
 
-		// Clear folder button (only when a folder is set)
-		if (this.plugin.settings.publishFolder) {
-			new Setting(containerEl)
-				.setName("")
-				.addButton(btn => btn
-					.setButtonText("Clear folder restriction (allow all notes)")
-					.onClick(async () => {
-						this.plugin.settings.publishFolder = "";
-						await this.plugin.saveSettings();
-						this.display();
-					})
-				);
-		}
-
 		// ── Template ─────────────────────────────────────────────
 		containerEl.createEl("h2", { text: "Template" });
 
 		const tplSetting = new Setting(containerEl)
 			.setName("Default template note")
-			.setDesc("Path to a note used as the template for new posts. Leave blank to use the built-in Hermes template. The note filename is used as the WordPress title.")
+			.setDesc("Path to a note used as the template for new posts. Leave blank to use the built-in WP-Publisher template. The note filename is used as the WordPress title.")
 			.addText(t => {
 				t.setPlaceholder("Templates/WP Post.md")
 					.setValue(this.plugin.settings.defaultTemplatePath)
@@ -1535,8 +1660,19 @@ class WPPublisherSettingTab extends PluginSettingTab {
 		// ── Categories ───────────────────────────────────────────
 		containerEl.createEl("h2", { text: "Categories" });
 		containerEl.createEl("p", {
-			text: "Add known WordPress categories here. Put each category on its own line, or separate categories with commas. If a category in note frontmatter does not exist in WordPress yet, WP Publisher will create it automatically when publishing.",
+			text: "Add known WordPress categories here. Put each category on its own line, or separate categories with commas.",
 		}).style.cssText = "font-size:13px;color:var(--text-muted);margin-bottom:8px;";
+
+		new Setting(containerEl)
+			.setName("Automatically create missing categories")
+			.setDesc("If enabled, missing categories are created in WordPress when a note is published or drafted, and for linked posts when category edits settle.")
+			.addToggle(t => t
+				.setValue(this.plugin.settings.autoCreateCategories)
+				.onChange(async v => {
+					this.plugin.settings.autoCreateCategories = v;
+					await this.plugin.saveSettings();
+				})
+			);
 
 		const categorySetting = new Setting(containerEl)
 			.setName("Known categories")
@@ -1546,6 +1682,8 @@ class WPPublisherSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.wpCategories)
 					.onChange(async v => {
 						this.plugin.settings.wpCategories = v;
+						this.plugin.settings.wpCategoriesLastSource = "manual";
+						this.plugin.settings.wpCategoriesLastMessage = "Edited Known categories manually.";
 						await this.plugin.saveSettings();
 						await this.plugin.updateCategoryCacheNote();
 						this.refreshCategoryList();
@@ -1560,11 +1698,15 @@ class WPPublisherSettingTab extends PluginSettingTab {
 				.setButtonText("?")
 				.setTooltip("Category list format")
 				.onClick(() => {
-					new Notice("Use one category per line or separate them with commas. If a note is published or drafted and the category is not in the list, the category is created automatically in WordPress.", 12000);
+					const behavior = this.plugin.settings.autoCreateCategories
+						? "If a note is published or drafted and the category is not in the list, the category is created automatically in WordPress."
+						: "If automatic category creation is off, only categories that already exist in WordPress will be assigned on publish or draft.";
+					new Notice(`Use one category per line or separate them with commas. ${behavior}`, 12000);
 				})
 			)
 			.addButton(btn => btn
 				.setButtonText("Refresh from WordPress")
+				.setCta()
 				.setTooltip("Replace Known categories with the current WordPress category list.")
 				.onClick(async () => {
 					const validErr = this.plugin.validateSettings();
@@ -1573,12 +1715,18 @@ class WPPublisherSettingTab extends PluginSettingTab {
 						const loaded = await fetchWordPressCategoryNames(this.plugin.settings);
 						const merged = mergeCategoryNames([], loaded);
 						this.plugin.settings.wpCategories = merged.join("\n");
+						this.plugin.settings.wpCategoriesLastRefreshedAt = Date.now();
+						this.plugin.settings.wpCategoriesLastSource = "wordpress";
+						this.plugin.settings.wpCategoriesLastWordPressSnapshot = normalizedCategorySnapshot(merged);
+						this.plugin.settings.wpCategoriesLastMessage = `Replaced Known categories from WordPress. ${merged.length} categories loaded.`;
 						await this.plugin.saveSettings();
 						await this.plugin.updateCategoryCacheNote();
 						this.refreshCategoryList();
 						new Notice(`✅ Loaded ${loaded.length} categories from WordPress.`);
-						this.display();
 					} catch (e: unknown) {
+						this.plugin.settings.wpCategoriesLastMessage = `Category refresh failed: ${e instanceof Error ? e.message : String(e)}`;
+						await this.plugin.saveSettings();
+						this.refreshCategoryStatus();
 						new Notice(`⛔ Category load failed: ${e instanceof Error ? e.message : String(e)}`, 10000);
 					}
 				})
@@ -1593,6 +1741,9 @@ class WPPublisherSettingTab extends PluginSettingTab {
 		categoryButtonRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
 		const categoryButtons = Array.from(categorySetting.controlEl.querySelectorAll("button"));
 		for (const button of categoryButtons) categoryButtonRow.appendChild(button);
+		this.categoryInlineStatusEl = categorySetting.controlEl.createDiv();
+		this.categoryInlineStatusEl.style.cssText = "font-size:12px;color:var(--text-muted);padding:8px 2px 0 2px;line-height:1.6;";
+		this.refreshCategoryStatus();
 
 		// ── Hotkeys ──────────────────────────────────────────────
 		containerEl.createEl("h2", { text: "Hotkeys" });
@@ -1603,9 +1754,21 @@ class WPPublisherSettingTab extends PluginSettingTab {
 		this.addHotkeySetting(containerEl, "Publish hotkey", "hotkeyPublish");
 		this.addHotkeySetting(containerEl, "Draft hotkey", "hotkeyDraft");
 
+		new Setting(containerEl)
+			.setName("Show sidebar publish button")
+			.setDesc("Show or hide the WP-Publisher button in Obsidian's left sidebar.")
+			.addToggle(t => t
+				.setValue(this.plugin.settings.showSidebarButton)
+				.onChange(async v => {
+					this.plugin.settings.showSidebarButton = v;
+					await this.plugin.saveSettings();
+					this.plugin.updateRibbonIcon();
+				})
+			);
+
 		// Note about Obsidian's built-in hotkey system
 		containerEl.createEl("p", {
-			text: "You can also assign hotkeys via Obsidian's built-in Settings \u2192 Hotkeys page \u2014 search for 'WP Publisher' to find all commands there.",
+			text: "You can also assign hotkeys via Obsidian's built-in Settings \u2192 Hotkeys page \u2014 search for 'WP-Publisher' to find all commands there.",
 		}).style.cssText = "font-size:12px;color:var(--text-muted);margin-top:8px;";
 
 		// ── Frontmatter reference ─────────────────────────────────
@@ -1618,9 +1781,19 @@ class WPPublisherSettingTab extends PluginSettingTab {
 			<code>excerpt:</code> — post summary / meta description<br>
 			<code>comments:</code> — <code>on</code> or <code>off</code>; sends WordPress comment_status open/closed for anti-bot control<br>
 			<code>status:</code> — updated automatically by the plugin<br>
-			<code>wp-id:</code> — visible publish marker, managed automatically by WP Publisher<br>
+			<code>wp-id:</code> — visible publish marker, managed automatically by WP-Publisher<br>
 			<code>wp-sync:</code> — <code>synced</code> after publish/draft; <code>out-of-sync</code> after local edits<br>
 		`;
+
+		const footer = containerEl.createEl("div");
+		footer.style.cssText = "margin-top:24px;padding-top:12px;border-top:1px solid var(--background-modifier-border);font-size:12px;color:var(--text-muted);";
+		footer.createSpan({ text: "WP-Publisher on GitHub: " });
+		const githubLink = footer.createEl("a", {
+			text: "github",
+			href: "https://github.com/Wicked-Shrapnel/Obsidian-2-WordPress-Plugin",
+		});
+		githubLink.setAttr("target", "_blank");
+		githubLink.setAttr("rel", "noopener");
 	}
 
 	// Show a green ✅ or red ⛔ next to the template path

@@ -37,7 +37,7 @@ WP Publisher does not include telemetry or analytics.
 7. Create a folder in your vault that you would like your posts to be stored in.
 8. Open your Obsidian Settings and go to WP-Publisher. 
 9. Paste in that application password, your site URL using HTTPS and your WordPress username. 
-10. Lock lock password. 
+10. Lock password and click test connection. 
 11. In the Publishing Rules section, Point to the folder that you created in step 7.  Only notes in this folder can be published to your site.
 12. The template section point it to your designated post template. I shipped the application with the one that use called `Site post template.md`
 13. Scroll down to the Categories section and click Refresh with WordPress. you should now see all your site categories populated in a list. 

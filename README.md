@@ -34,7 +34,7 @@ WP Publisher does not include telemetry or analytics.
 5. Type something into the new application password name field like obsidian or whatever you would like and click add application password.
 6. Immediately copy that password. It will disappear if you refresh the page.
 
-7. Create a folder in your vault that you would like your posts to be stored. 
+7. Create a folder in your vault that you would like your posts to be stored in.
 8. Open your Obsidian Settings and go to WP-Publisher. 
 9. Paste in that application password, your site URL using HTTPS and your WordPress username. 
 10. Lock lock password. 

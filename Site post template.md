@@ -6,7 +6,7 @@ comments: off
 wp-id:
 wp-sync:
 ---
-%% [[Writing Reference]] | Categories: Blog Â· News Â· Projects Â· To Do List Â· Uncategorized Â· Write Ups %%
+%% [[Writing Reference]] %%
 
 %%
 Ctrl + Alt + D = Draft

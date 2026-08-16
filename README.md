@@ -23,7 +23,7 @@ Inspired by a Network Chuck video:
 9. Paste in that application password, your site URL using HTTPS and your WordPress username. 
 10. Lock lock password. 
 11. In the Publishing Rules section, Point to the folder that you created in step 7.  Only notes in this folder can be published to your site.
-12. The template section point it to your designated post template. I shipped the application with the one that use called `Site post template.md`
+12. The template section point it to your designated post template. I shipped the application with the one that use called [Site post template.md](https://github.com/Wicked-Shrapnel/Obsidian-2-WordPress-Plugin/blob/main/Site%20post%20template.md)
 13. Scroll down to the Categories section and click Refresh with WordPress. you should now see all your site categories populated in a list. 
 14. Go to the hotkeys section and record a publish and a draft hotkey. 
 15. Navigate to your posts folder and create a new note. If you left automatic template on new note in published folder enabled then the template should automatically be applied to new notes in this folder. Notes created in this folder will also automatically have the default name of site post 1, 2, etc, But you can change that to whatever you would like. The title on the note will be the title on your site. 

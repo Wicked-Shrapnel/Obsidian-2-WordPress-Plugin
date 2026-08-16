@@ -33,22 +33,6 @@ You're all set up now.
 
 1. Create or open a note inside your configured publish folder.
 2. Use the optional Site post template.md file
----
-category:
-excerpt:
-status: draft
-comments: off
-wp-id:
-wp-sync:
----
-
-%% [[Writing Reference]] | Categories: Blog · News · Projects · To Do List · Uncategorized · Write Ups %%
-
-%%
-Ctrl + Alt + D = Draft
-Ctrl + Shift + P = Publish
-%%
-
 4. Write the post in Markdown and fill in any frontmatter you want to control, such as `category:`, `excerpt:`, `comments:`, or `status:`.
 5. Use `%% double percent signs %%` for private notes or reminders you do not want published.
 6. Press your publish or draft hotkey, or click the sidebar publish button.

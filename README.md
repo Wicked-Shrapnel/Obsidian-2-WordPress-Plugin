@@ -41,14 +41,13 @@ comments: off
 wp-id:
 wp-sync:
 ---
-%% [[Writing Reference]]
+
+%% [[Writing Reference]] | Categories: Blog · News · Projects · To Do List · Uncategorized · Write Ups %%
 
 %%
 Ctrl + Alt + D = Draft
 Ctrl + Shift + P = Publish
 %%
-
----
 
 4. Write the post in Markdown and fill in any frontmatter you want to control, such as `category:`, `excerpt:`, `comments:`, or `status:`.
 5. Use `%% double percent signs %%` for private notes or reminders you do not want published.

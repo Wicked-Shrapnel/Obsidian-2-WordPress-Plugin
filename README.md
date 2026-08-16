@@ -54,5 +54,3 @@ You're all set up now.
 - Stores the WordPress URL, username, application password, category list, template path, and local sync metadata in plugin settings
 - Reads files from the configured publish folder and uploads any referenced images to WordPress
 - Does not include telemetry or analytics
-
-For installation and first-time setup, see the full setup guide in this repository.

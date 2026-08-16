@@ -32,7 +32,8 @@ You're all set up now.
 ## General Workflow
 
 1. Create or open a note inside your configured publish folder.
-2. Use the optional Site post template.md file
+2. Use the optional Site post template.md file. [Site post template.md](https://github.com/Wicked-Shrapnel/Obsidian-2-WordPress-Plugin/blob/main/Site%20post%20template.md)
+ (If you already have your own template, you can keep using that one.)
 4. Write the post in Markdown and fill in any frontmatter you want to control, such as `category:`, `excerpt:`, `comments:`, or `status:`.
 5. Use `%% double percent signs %%` for private notes or reminders you do not want published.
 6. Press your publish or draft hotkey, or click the sidebar publish button.

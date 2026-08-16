@@ -9,12 +9,10 @@ Inspired by a Network Chuck video:
 ## General Workflow
 
 1. Create or open a note inside your configured publish folder.
-   <img width="1873" height="998" alt="image" src="https://github.com/user-attachments/assets/dbe556dd-265b-4c76-9381-3f495a52211d" />
-   
-3. Write the post in Markdown and fill in any frontmatter you want to control, such as `category:`, `excerpt:`, `comments:`, or `status:`.
-4. Use `%% double percent signs %%` for private notes or reminders you do not want published.
-5. Press your publish or draft hotkey, or click the sidebar publish button.
-6. WP-Publisher publishes the note to WordPress, updates the existing post if it already has a `wp-id`, and keeps `wp-sync` updated.
+2. Write the post in Markdown and fill in any frontmatter you want to control, such as `category:`, `excerpt:`, `comments:`, or `status:`.
+3. Use `%% double percent signs %%` for private notes or reminders you do not want published.
+4. Press your publish or draft hotkey, or click the sidebar publish button.
+5. WP-Publisher publishes the note to WordPress, updates the existing post if it already has a `wp-id`, and keeps `wp-sync` updated.
 
 ## What It Handles
 

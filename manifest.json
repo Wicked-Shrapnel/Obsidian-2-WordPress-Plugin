@@ -3,8 +3,8 @@
   "name": "WP-Publisher",
   "version": "1.0.4",
   "minAppVersion": "1.4.0",
-  "description": "Publish and draft notes from a dedicated Obsidian folder to WordPress with templates, categories, images, comments, hotkeys, and sync status.",
+  "description": "Publish and draft notes from a dedicated folder to WordPress with templates, categories, images, comments, hotkeys, and sync status.",
   "author": "Wicked-Shrapnel",
-  "authorUrl": "https://github.com/Wicked-Shrapnel/Obsidian-2-WordPress-Plugin",
+  "authorUrl": "https://github.com/Wicked-Shrapnel",
   "isDesktopOnly": true
 }

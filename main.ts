@@ -427,9 +427,15 @@ async function deleteFrontmatterKey(app: App, file: TFile, key: string) {
 // ─────────────────────────────────────────────
 
 interface WPPost { id: number; status: string; link: string; }
-interface WPCurrentUser { id: number; name?: string; slug?: string; username?: string; }
+interface WPCurrentUser { id: number; name?: string; slug?: string; username?: string; email?: string; }
 
-function basicAuth(u: string, p: string) { return "Basic " + btoa(`${u}:${p}`); }
+function basicAuth(u: string, p: string) {
+	const raw = `${u.trim()}:${p.trim()}`;
+	const bytes = new TextEncoder().encode(raw);
+	let binary = "";
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return "Basic " + btoa(binary);
+}
 
 function normalizeWpIdentity(value: string): string {
 	return value.trim().toLowerCase();
@@ -437,28 +443,37 @@ function normalizeWpIdentity(value: string): string {
 
 function wpUserMatchesConfiguredUsername(user: WPCurrentUser, configuredUsername: string): boolean {
 	const expected = normalizeWpIdentity(configuredUsername);
-	return [user.username, user.slug, user.name]
+	return [user.username, user.slug, user.name, user.email]
 		.filter(Boolean)
 		.some(value => normalizeWpIdentity(String(value)) === expected);
+}
+
+function describeWpUser(user: WPCurrentUser): string {
+	return user.username || user.slug || user.email || user.name || `user #${user.id}`;
 }
 
 async function testWordPressConnection(s: WPPublisherSettings): Promise<WPCurrentUser> {
 	const base = s.wpUrl.replace(/\/$/, "");
 	const resp = await requestUrl({
-		url: `${base}/wp-json/wp/v2/users/me?context=edit`,
+		url: `${base}/wp-json/wp/v2/users/me`,
 		method: "GET",
 		headers: { Authorization: basicAuth(s.wpUsername, s.wpPassword) },
 		throw: false,
 	});
 	if (resp.status >= 400) {
 		let msg = `HTTP ${resp.status}`;
-		try { const e = resp.json; if (e?.message) msg = e.message; else if (e?.code) msg = e.code; } catch { /**/ }
+		try {
+			const e = resp.json;
+			if (e?.message && e?.code) msg = `HTTP ${resp.status}: ${e.message} (${e.code})`;
+			else if (e?.message) msg = `HTTP ${resp.status}: ${e.message}`;
+			else if (e?.code) msg = `HTTP ${resp.status}: ${e.code}`;
+		} catch { /**/ }
 		throw new Error(msg);
 	}
 	const user = resp.json as WPCurrentUser;
 	if (!user?.id) throw new Error("WordPress did not return an authenticated user.");
 	if (!wpUserMatchesConfiguredUsername(user, s.wpUsername)) {
-		const actual = user.username || user.slug || user.name || `user #${user.id}`;
+		const actual = describeWpUser(user);
 		throw new Error(`Authenticated as "${actual}", not "${s.wpUsername}". Check the WordPress username.`);
 	}
 	return user;
@@ -1555,14 +1570,22 @@ class WPPublisherSettingTab extends PluginSettingTab {
 		const testResult = testRow.createEl("span");
 		testResult.style.cssText = "margin-left:12px;font-size:13px;";
 		testBtn.onclick = async () => {
-			testResult.textContent = "Testing…";
+			testResult.textContent = "Testing...";
 			const validErr = this.plugin.validateSettings();
-			if (validErr) { testResult.textContent = `⛔ ${validErr}`; return; }
+			if (validErr) {
+				testResult.textContent = `⚠️ Connection failed: ${validErr}`;
+				new Notice(`⚠️ Connection failed: ${validErr}`, 8000);
+				return;
+			}
 			try {
-				await testWordPressConnection(this.plugin.settings);
-				testResult.textContent = "✅ Connected";
+				const user = await testWordPressConnection(this.plugin.settings);
+				const note = `✅ Connected as ${describeWpUser(user)}`;
+				testResult.textContent = note;
+				new Notice(note, 8000);
 			} catch (e: unknown) {
-				testResult.textContent = `⛔ ${e instanceof Error ? e.message : String(e)}`;
+				const message = e instanceof Error ? e.message : String(e);
+				testResult.textContent = `⚠️ Connection failed: ${message}`;
+				new Notice(`⚠️ Connection failed: ${message}`, 10000);
 			}
 		};
 

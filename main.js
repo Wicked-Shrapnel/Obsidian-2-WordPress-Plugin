@@ -356,19 +356,26 @@ async function deleteFrontmatterKey(app, file, key) {
   if (content !== originalContent) await app.vault.modify(file, content);
 }
 function basicAuth(u, p) {
-  return "Basic " + btoa(`${u}:${p}`);
+  const raw = `${u.trim()}:${p.trim()}`;
+  const bytes = new TextEncoder().encode(raw);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return "Basic " + btoa(binary);
 }
 function normalizeWpIdentity(value) {
   return value.trim().toLowerCase();
 }
 function wpUserMatchesConfiguredUsername(user, configuredUsername) {
   const expected = normalizeWpIdentity(configuredUsername);
-  return [user.username, user.slug, user.name].filter(Boolean).some((value) => normalizeWpIdentity(String(value)) === expected);
+  return [user.username, user.slug, user.name, user.email].filter(Boolean).some((value) => normalizeWpIdentity(String(value)) === expected);
+}
+function describeWpUser(user) {
+  return user.username || user.slug || user.email || user.name || `user #${user.id}`;
 }
 async function testWordPressConnection(s) {
   const base = s.wpUrl.replace(/\/$/, "");
   const resp = await (0, import_obsidian.requestUrl)({
-    url: `${base}/wp-json/wp/v2/users/me?context=edit`,
+    url: `${base}/wp-json/wp/v2/users/me`,
     method: "GET",
     headers: { Authorization: basicAuth(s.wpUsername, s.wpPassword) },
     throw: false
@@ -377,8 +384,9 @@ async function testWordPressConnection(s) {
     let msg = `HTTP ${resp.status}`;
     try {
       const e = resp.json;
-      if (e == null ? void 0 : e.message) msg = e.message;
-      else if (e == null ? void 0 : e.code) msg = e.code;
+      if ((e == null ? void 0 : e.message) && (e == null ? void 0 : e.code)) msg = `HTTP ${resp.status}: ${e.message} (${e.code})`;
+      else if (e == null ? void 0 : e.message) msg = `HTTP ${resp.status}: ${e.message}`;
+      else if (e == null ? void 0 : e.code) msg = `HTTP ${resp.status}: ${e.code}`;
     } catch {
     }
     throw new Error(msg);
@@ -386,7 +394,7 @@ async function testWordPressConnection(s) {
   const user = resp.json;
   if (!(user == null ? void 0 : user.id)) throw new Error("WordPress did not return an authenticated user.");
   if (!wpUserMatchesConfiguredUsername(user, s.wpUsername)) {
-    const actual = user.username || user.slug || user.name || `user #${user.id}`;
+    const actual = describeWpUser(user);
     throw new Error(`Authenticated as "${actual}", not "${s.wpUsername}". Check the WordPress username.`);
   }
   return user;
@@ -1355,17 +1363,22 @@ var WPPublisherSettingTab = class extends import_obsidian.PluginSettingTab {
     const testResult = testRow.createEl("span");
     testResult.style.cssText = "margin-left:12px;font-size:13px;";
     testBtn.onclick = async () => {
-      testResult.textContent = "Testing\u2026";
+      testResult.textContent = "Testing...";
       const validErr = this.plugin.validateSettings();
       if (validErr) {
-        testResult.textContent = `\u26D4 ${validErr}`;
+        testResult.textContent = `\u26A0\uFE0F Connection failed: ${validErr}`;
+        new import_obsidian.Notice(`\u26A0\uFE0F Connection failed: ${validErr}`, 8e3);
         return;
       }
       try {
-        await testWordPressConnection(this.plugin.settings);
-        testResult.textContent = "\u2705 Connected";
+        const user = await testWordPressConnection(this.plugin.settings);
+        const note = `\u2705 Connected as ${describeWpUser(user)}`;
+        testResult.textContent = note;
+        new import_obsidian.Notice(note, 8e3);
       } catch (e) {
-        testResult.textContent = `\u26D4 ${e instanceof Error ? e.message : String(e)}`;
+        const message = e instanceof Error ? e.message : String(e);
+        testResult.textContent = `\u26A0\uFE0F Connection failed: ${message}`;
+        new import_obsidian.Notice(`\u26A0\uFE0F Connection failed: ${message}`, 1e4);
       }
     };
     containerEl.createEl("h2", { text: "Publishing rules" });
